@@ -45,7 +45,7 @@ Response: Returns backend response to client
 
 ```csv
 subdomain,proxy_to,strip_path,strip_query
-eth,backend.example.com/api,false,false
+eth,https://backend.example.com/api,false,false
 ```
 
 ### Fields
@@ -57,12 +57,12 @@ eth,backend.example.com/api,false,false
 
 ### Examples
 
-| Configuration                                | Incoming Request                                | Proxied Request                                |
-|----------------------------------------------|-------------------------------------------------|------------------------------------------------|
-| `eth,backend.example.com/v1/abc,true,true`   | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc`           |
-| `eth,backend.example.com/v1/abc,false,true`  | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc/foo`       |
-| `eth,backend.example.com/v1/abc,false,false` | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc/foo?bar=1` |
-| `eth,backend.example.com/v1/abc,true,false`  | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc?bar=1`     |
+| Configuration                                        | Incoming Request                                | Proxied Request                                |
+|------------------------------------------------------|-------------------------------------------------|------------------------------------------------|
+| `eth,https://backend.example.com/v1/abc,true,true`   | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc`           |
+| `eth,https://backend.example.com/v1/abc,false,true`  | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc/foo`       |
+| `eth,https://backend.example.com/v1/abc,false,false` | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc/foo?bar=1` |
+| `eth,https://backend.example.com/v1/abc,true,false`  | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc?bar=1`     |
 
 ### Header Forwarding
 

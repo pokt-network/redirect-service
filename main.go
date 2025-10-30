@@ -277,12 +277,8 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse backend URL
-	scheme := "https"
-	if r.TLS == nil {
-		scheme = "http"
-	}
-	targetURL, err := url.Parse(fmt.Sprintf("%s://%s", scheme, rule.ProxyTo))
+	// Parse backend URL (proxy_to must include scheme: http:// or https://)
+	targetURL, err := url.Parse(rule.ProxyTo)
 	if err != nil {
 		log.Printf("ERROR: Invalid proxy_to URL for subdomain '%s': %v", subdomain, err)
 		proxyRequestsTotal.WithLabelValues(subdomain, "500").Inc()
@@ -302,7 +298,7 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		startTime:     start,
 		rule:          rule,
 		targetURL:     targetURL,
-		scheme:        scheme,
+		scheme:        targetURL.Scheme,
 		host:          host,
 		clientIP:      clientIP,
 		originalPath:  r.URL.Path,
@@ -311,7 +307,7 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(ctx)
 
 	// Get or create a cached proxy for this backend
-	cacheKey := fmt.Sprintf("%s://%s", scheme, rule.ProxyTo)
+	cacheKey := targetURL.Scheme + "://" + targetURL.Host
 	var proxy *httputil.ReverseProxy
 
 	if cached, ok := s.proxies.Load(cacheKey); ok {
