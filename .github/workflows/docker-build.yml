@@ -20,6 +20,37 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binaries
+        run: |
+          # Build for linux/amd64
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
+            -ldflags="-s -w -extldflags '-static'" \
+            -o taiji-linux-amd64 \
+            main.go
+
+          # Build for linux/arm64
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build \
+            -ldflags="-s -w -extldflags '-static'" \
+            -o taiji-linux-arm64 \
+            main.go
+
+          # Build for darwin/amd64 (Intel Mac)
+          GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build \
+            -ldflags="-s -w" \
+            -o taiji-darwin-amd64 \
+            main.go
+
+          # Build for darwin/arm64 (Apple Silicon)
+          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build \
+            -ldflags="-s -w" \
+            -o taiji-darwin-arm64 \
+            main.go
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3.11.1
 
@@ -56,6 +87,11 @@ jobs:
         uses: softprops/action-gh-release@v2.3.3
         with:
           generate_release_notes: true
+          files: |
+            taiji-linux-amd64
+            taiji-linux-arm64
+            taiji-darwin-amd64
+            taiji-darwin-arm64
           body: |
             ## Docker Image
 
@@ -69,3 +105,12 @@ jobs:
             ### Platforms:
             - linux/amd64
             - linux/arm64
+
+            ## Binaries
+
+            Download the pre-built binaries for your platform:
+
+            - **Linux (amd64)**: `taiji-linux-amd64`
+            - **Linux (arm64)**: `taiji-linux-arm64`
+            - **macOS (Intel)**: `taiji-darwin-amd64`
+            - **macOS (Apple Silicon)**: `taiji-darwin-arm64`
