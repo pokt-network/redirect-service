@@ -1,0 +1,4 @@
+subdomain,proxy_to,strip_path,strip_query
+httpbin_strip,localhost:4040/get,true,true
+httpbin_path,localhost:4040/anything,false,true
+httpbin,localhost:4040,false,false

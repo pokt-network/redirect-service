@@ -1,0 +1,31 @@
+# Git
+.git/
+.gitignore
+
+# Documentation
+README.md
+*.md
+
+# IDE
+.idea/
+.vscode/
+
+# Build artifacts
+bin/
+*.test
+*.out
+
+# Kubernetes manifests (not needed in image)
+kubernetes/
+
+# Development files
+Makefile
+.dockerignore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+*.tmp
