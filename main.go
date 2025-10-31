@@ -432,7 +432,13 @@ func (s *ProxyService) createReverseProxy() *httputil.ReverseProxy {
 			// Set backend URL
 			req.URL.Scheme = meta.targetURL.Scheme
 			req.URL.Host = meta.targetURL.Host
-			req.Host = meta.targetURL.Host
+
+			// Set Host header - check if custom Host is in extra_headers first
+			if customHost, hasCustomHost := meta.rule.ExtraHeaders["Host"]; hasCustomHost {
+				req.Host = customHost
+			} else {
+				req.Host = meta.targetURL.Host
+			}
 
 			// Handle path
 			if meta.rule.StripPath {
@@ -458,8 +464,12 @@ func (s *ProxyService) createReverseProxy() *httputil.ReverseProxy {
 				req.URL.RawQuery = meta.originalQuery
 			}
 
-			// Apply extra headers from backend config
+			// Apply extra headers from backend config (except Host which was already set)
 			for k, v := range meta.rule.ExtraHeaders {
+				if k == "Host" {
+					// Host was already set via req.Host above
+					continue
+				}
 				req.Header.Set(k, v)
 			}
 
