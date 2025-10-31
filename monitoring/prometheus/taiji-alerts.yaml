@@ -1,0 +1,259 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: taiji-alerts
+  namespace: monitoring
+  labels:
+    app: kube-prometheus-stack
+    release: kps
+spec:
+  groups:
+  - name: taiji.alerts
+    interval: 30s
+    rules:
+    # Critical: Subdomain experiencing high 5xx error rate
+    - alert: TaijiSubdomainHighServerErrors
+      expr: |
+        (
+          sum by (subdomain) (rate(proxy_requests_total{job="taiji",status_code=~"5.."}[5m]))
+          / sum by (subdomain) (rate(proxy_requests_total{job="taiji"}[5m]))
+        ) > 0.05
+      for: 5m
+      labels:
+        severity: critical
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji subdomain {{ $labels.subdomain }} experiencing high 5xx errors"
+        description: "Subdomain {{ $labels.subdomain }} has {{ $value | humanizePercentage }} 5xx error rate over the last 5 minutes."
+
+    # Warning: Subdomain experiencing elevated 5xx error rate
+    - alert: TaijiSubdomainElevatedServerErrors
+      expr: |
+        (
+          sum by (subdomain) (rate(proxy_requests_total{job="taiji",status_code=~"5.."}[5m]))
+          / sum by (subdomain) (rate(proxy_requests_total{job="taiji"}[5m]))
+        ) > 0.01
+      for: 10m
+      labels:
+        severity: warning
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji subdomain {{ $labels.subdomain }} has elevated 5xx errors"
+        description: "Subdomain {{ $labels.subdomain }} has {{ $value | humanizePercentage }} 5xx error rate over the last 5 minutes."
+
+    # Critical: High absolute number of 5xx errors
+    - alert: TaijiSubdomainMany5xxErrors
+      expr: |
+        sum by (subdomain) (rate(proxy_requests_total{job="taiji",status_code=~"5.."}[5m])) > 1
+      for: 5m
+      labels:
+        severity: critical
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji subdomain {{ $labels.subdomain }} has many 5xx errors"
+        description: "Subdomain {{ $labels.subdomain }} is generating {{ printf \"%.2f\" $value }} 5xx errors per second."
+
+    # Critical: Backend experiencing high error rate
+    - alert: TaijiBackendHighErrorRate
+      expr: |
+        (
+          sum by (subdomain, backend) (rate(proxy_requests_total{job="taiji",status_code=~"5.."}[5m]))
+          / sum by (subdomain, backend) (rate(proxy_requests_total{job="taiji"}[5m]))
+        ) > 0.10
+      for: 5m
+      labels:
+        severity: critical
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji backend {{ $labels.backend }} (subdomain {{ $labels.subdomain }}) has high error rate"
+        description: "Backend {{ $labels.backend }} for subdomain {{ $labels.subdomain }} has {{ $value | humanizePercentage }} error rate."
+
+    # Warning: Backend experiencing elevated error rate
+    - alert: TaijiBackendElevatedErrorRate
+      expr: |
+        (
+          sum by (subdomain, backend) (rate(proxy_requests_total{job="taiji",status_code=~"5.."}[5m]))
+          / sum by (subdomain, backend) (rate(proxy_requests_total{job="taiji"}[5m]))
+        ) > 0.03
+      for: 10m
+      labels:
+        severity: warning
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji backend {{ $labels.backend }} (subdomain {{ $labels.subdomain }}) has elevated error rate"
+        description: "Backend {{ $labels.backend }} for subdomain {{ $labels.subdomain }} has {{ $value | humanizePercentage }} error rate."
+
+    # Critical: Backend generating many 502 errors (likely down)
+    - alert: TaijiBackendMany502Errors
+      expr: |
+        sum by (subdomain, backend) (rate(proxy_requests_total{job="taiji",status_code="502"}[5m])) > 0.5
+      for: 5m
+      labels:
+        severity: critical
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji backend {{ $labels.backend }} appears down"
+        description: "Backend {{ $labels.backend }} for subdomain {{ $labels.subdomain }} is generating {{ printf \"%.2f\" $value }} 502 errors per second (backend likely unreachable)."
+
+    # Critical: Taiji service is down
+    - alert: TaijiServiceDown
+      expr: |
+        up{job="taiji"} == 0
+      for: 2m
+      labels:
+        severity: critical
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji service instance down"
+        description: "Taiji instance {{ $labels.instance }} has been down for more than 2 minutes."
+
+    # Critical: All Taiji instances down
+    - alert: TaijiServiceCompleteOutage
+      expr: |
+        sum(up{job="taiji"}) == 0
+      for: 1m
+      labels:
+        severity: critical
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji service complete outage"
+        description: "All Taiji instances are down. Service is completely unavailable."
+
+    # Warning: High latency
+    - alert: TaijiHighLatency
+      expr: |
+        histogram_quantile(0.99, sum by (le) (rate(proxy_request_duration_seconds_bucket{job="taiji"}[5m]))) > 1
+      for: 10m
+      labels:
+        severity: warning
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji service experiencing high latency"
+        description: "Taiji P99 latency is {{ $value | humanizeDuration }} over the last 5 minutes."
+
+    # Warning: Backend experiencing high latency
+    - alert: TaijiBackendHighLatency
+      expr: |
+        histogram_quantile(0.99, sum by (subdomain, backend, le) (rate(proxy_request_duration_seconds_bucket{job="taiji"}[5m]))) > 2
+      for: 10m
+      labels:
+        severity: warning
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji backend {{ $labels.backend }} has high latency"
+        description: "Backend {{ $labels.backend }} for subdomain {{ $labels.subdomain }} has P99 latency of {{ $value | humanizeDuration }}."
+
+    # Critical: Subdomain has high 404 rate (possible misconfiguration)
+    - alert: TaijiSubdomainHigh404Rate
+      expr: |
+        (
+          sum by (subdomain) (rate(proxy_requests_total{job="taiji",status_code="404"}[10m]))
+          / sum by (subdomain) (rate(proxy_requests_total{job="taiji"}[10m]))
+        ) > 0.50
+      for: 15m
+      labels:
+        severity: warning
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji subdomain {{ $labels.subdomain }} has high 404 rate"
+        description: "Subdomain {{ $labels.subdomain }} has {{ $value | humanizePercentage }} 404 error rate, indicating possible misconfiguration or unconfigured subdomain."
+
+    # Critical: CSV reload errors
+    - alert: TaijiCSVReloadFailures
+      expr: |
+        rate(proxy_csv_reload_errors_total{job="taiji"}[10m]) > 0
+      for: 5m
+      labels:
+        severity: critical
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji configuration reload failures"
+        description: "Taiji is experiencing CSV configuration reload errors at {{ printf \"%.3f\" $value }} per second."
+
+    # Warning: File watcher restarts
+    - alert: TaijiWatcherRestarts
+      expr: |
+        increase(proxy_watcher_restarts_total{job="taiji"}[30m]) > 2
+      for: 5m
+      labels:
+        severity: warning
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji file watcher restarting frequently"
+        description: "Taiji file watcher has restarted {{ printf \"%.0f\" $value }} times in the last 30 minutes on instance {{ $labels.instance }}."
+
+    # Warning: Low request rate (possible issue) - Fixed formatting!
+    - alert: TaijiLowTraffic
+      expr: |
+        sum(rate(proxy_requests_total{job="taiji"}[5m])) < 0.1
+      for: 15m
+      labels:
+        severity: warning
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji service experiencing unusually low traffic"
+        description: "Taiji is receiving only {{ printf \"%.4f\" $value }} requests per second ({{ printf \"%.2f\" (mul $value 60) }} requests/min), which may indicate an upstream routing issue."
+
+    # Critical: Subdomain backend completely failing
+    - alert: TaijiSubdomainBackendDown
+      expr: |
+        (
+          sum by (subdomain) (rate(proxy_requests_total{job="taiji",status_code=~"5.."}[5m]))
+          / sum by (subdomain) (rate(proxy_requests_total{job="taiji"}[5m]))
+        ) > 0.95
+        and
+        sum by (subdomain) (rate(proxy_requests_total{job="taiji"}[5m])) > 0.1
+      for: 5m
+      labels:
+        severity: critical
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji subdomain {{ $labels.subdomain }} backend appears down"
+        description: "Subdomain {{ $labels.subdomain }} has {{ $value | humanizePercentage }} error rate, backend may be completely down."
+
+    # Warning: Uneven backend load distribution (round-robin issue)
+    - alert: TaijiUnevenBackendLoad
+      expr: |
+        (
+          max by (subdomain) (sum by (subdomain, backend) (rate(proxy_requests_total{job="taiji"}[10m])))
+          /
+          min by (subdomain) (sum by (subdomain, backend) (rate(proxy_requests_total{job="taiji"}[10m])) > 0)
+        ) > 5
+        and
+        count by (subdomain) (sum by (subdomain, backend) (rate(proxy_requests_total{job="taiji"}[10m])) > 0) > 1
+      for: 15m
+      labels:
+        severity: warning
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji subdomain {{ $labels.subdomain }} has uneven backend load"
+        description: "Subdomain {{ $labels.subdomain }} has backends with request rate difference of {{ printf \"%.1fx\" $value }}, indicating one backend may be down or slow."
+
+    # Critical: Backend consistently slow
+    - alert: TaijiBackendSlowResponse
+      expr: |
+        histogram_quantile(0.50, sum by (subdomain, backend, le) (rate(proxy_request_duration_seconds_bucket{job="taiji"}[5m]))) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji backend {{ $labels.backend }} is consistently slow"
+        description: "Backend {{ $labels.backend }} for subdomain {{ $labels.subdomain }} has P50 latency of {{ $value | humanizeDuration }}, indicating performance degradation."

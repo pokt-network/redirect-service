@@ -21,6 +21,7 @@ This service acts as a reverse proxy from `*.test-api.pocket.network` (or `*.api
   - Video/audio streaming
 - **Full Request Forwarding**: Forwards all headers, body, path, query parameters, and client IP
 - **Per-Rule Configuration**: Each subdomain can have a unique proxy behavior
+- **Multiple Backends**: Round-robin load balancing with optional retry-all policy
 - **Hot Reload**: Automatically reloads CSV configuration without restart
 - **Production Ready**: Battle-tested Go standard library, no body size limits, generous timeouts
 - **Observable**: Prometheus metrics, structured logging
@@ -44,25 +45,39 @@ Response: Returns backend response to client
 ## CSV Configuration Format
 
 ```csv
-subdomain,proxy_to,strip_path,strip_query
-eth,https://backend.example.com/api,false,false
+subdomain,proxy_to,strip_path,strip_query,extra_headers
+eth,https://backend.example.com/api,false,false,""
 ```
 
 ### Fields
 
 - **subdomain**: Subdomain to match (without domain suffix)
-- **proxy_to**: Backend destination host/path (without a scheme - HTTPS is used by default)
+- **proxy_to**: Backend destination host/path (must include scheme: http:// or https://)
 - **strip_path**: Remove an incoming path before forwarding? (true/false)
 - **strip_query**: Remove incoming query string before forwarding? (true/false)
+- **extra_headers**: Optional JSON object with custom headers to add for this backend (e.g., `{"Authorization": "Bearer token"}`)
+
+### Multiple Backends (Load Balancing)
+
+You can configure multiple backends for the same subdomain by adding multiple rows with the same subdomain name. Requests will be distributed across backends using **round-robin** load balancing:
+
+```csv
+subdomain,proxy_to,strip_path,strip_query,extra_headers
+eth,https://backend1.example.com,false,false,""
+eth,https://backend2.example.com,false,false,"{""Authorization"": ""Bearer token123""}"
+eth,https://backend3.example.com,false,false,""
+```
+
+**Note**: When using JSON in the extra_headers field, internal quotes must be escaped by doubling them (`""`) for proper CSV parsing.
 
 ### Examples
 
-| Configuration                                        | Incoming Request                                | Proxied Request                                |
-|------------------------------------------------------|-------------------------------------------------|------------------------------------------------|
-| `eth,https://backend.example.com/v1/abc,true,true`   | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc`           |
-| `eth,https://backend.example.com/v1/abc,false,true`  | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc/foo`       |
-| `eth,https://backend.example.com/v1/abc,false,false` | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc/foo?bar=1` |
-| `eth,https://backend.example.com/v1/abc,true,false`  | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc?bar=1`     |
+| Configuration                                              | Incoming Request                                | Proxied Request                                |
+|------------------------------------------------------------|-------------------------------------------------|------------------------------------------------|
+| `eth,https://backend.example.com/v1/abc,true,true,""`      | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc`           |
+| `eth,https://backend.example.com/v1/abc,false,true,""`     | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc/foo`       |
+| `eth,https://backend.example.com/v1/abc,false,false,""`    | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc/foo?bar=1` |
+| `eth,https://backend.example.com/v1/abc,true,false,""`     | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc?bar=1`     |
 
 ### Header Forwarding
 
@@ -81,6 +96,25 @@ The proxy automatically adds the following headers to backend requests:
 
 #### All Original Headers
 - All incoming headers are forwarded to the backend (except hop-by-hop headers like Connection, Keep-Alive, Transfer-Encoding, etc.)
+
+### Retry Policy
+
+When multiple backends are configured for a subdomain, you can control the retry behavior using the `Retry-Policy` header in your request:
+
+- **`Retry-Policy: fail-fast`** (default): Uses round-robin to select one backend. If it fails, return the error immediately.
+- **`Retry-Policy: retry-all`**: Tries all backends in round-robin order until one succeeds (2xx status) or all are exhausted.
+
+Example:
+```bash
+# Try all backends until success
+curl -H "Host: eth.test-api.pocket.network" \
+     -H "Retry-Policy: retry-all" \
+     http://localhost:8080/v1/relay
+
+# Use single backend (default)
+curl -H "Host: eth.test-api.pocket.network" \
+     http://localhost:8080/v1/relay
+```
 
 ## Streaming Architecture
 
@@ -226,23 +260,50 @@ Edit the CSV file specified in `CSV_PATH` and the service automatically detects 
 
 ## Monitoring
 
+Taiji includes ready-to-use Grafana dashboards and Prometheus alerts for production monitoring.
+
+### Kubernetes/OpenShift Deployment
+
+Pre-configured monitoring resources are available in the `monitoring/` directory:
+
+- **`monitoring/grafana/taiji-dashboard.yaml`** - Grafana dashboard ConfigMap with:
+  - Backend filtering support
+  - Multi-backend traffic visualization
+  - Per-backend error rates and latency
+  - Load distribution analysis
+  - Round-robin health monitoring
+
+- **`monitoring/prometheus/taiji-alerts.yaml`** - PrometheusRule with alerts for:
+  - High error rates (by subdomain and backend)
+  - Backend health issues (502 errors, latency)
+  - Service availability
+  - Configuration reload failures
+  - Uneven load distribution
+  - Performance degradation
+
+**To deploy:**
+```bash
+kubectl apply -f monitoring/grafana/taiji-dashboard.yaml
+kubectl apply -f monitoring/prometheus/taiji-alerts.yaml
+```
+
 ### Prometheus Metrics
 
 ```
-# Number of proxy rules loaded
+# Number of proxy backends loaded (total across all subdomains)
 proxy_rules_total
 
 # Last successful rule load timestamp
 proxy_rules_last_load_timestamp_seconds
 
-# Total proxy requests by subdomain and status code
-proxy_requests_total{subdomain="eth",status_code="200"}
+# Total proxy requests by subdomain, backend, and status code
+proxy_requests_total{subdomain="eth",backend="backend1.example.com",status_code="200"}
 
-# Proxy request duration by subdomain
-proxy_request_duration_seconds{subdomain="eth"}
+# Proxy request duration by subdomain and backend
+proxy_request_duration_seconds{subdomain="eth",backend="backend1.example.com"}
 
-# Last successful proxy request timestamp
-proxy_last_request_timestamp_seconds{subdomain="eth"}
+# Last successful proxy request timestamp by subdomain and backend
+proxy_last_request_timestamp_seconds{subdomain="eth",backend="backend1.example.com"}
 
 # Active proxy rules by subdomain
 proxy_rule_active{subdomain="eth"}
@@ -254,6 +315,8 @@ proxy_csv_reload_errors_total
 # File watcher restarts
 proxy_watcher_restarts_total
 ```
+
+**Note**: The `backend` label in metrics allows you to track load distribution and health of individual backends within a subdomain.
 
 ### Logs
 

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
 	"os"
@@ -55,23 +57,23 @@ var (
 		Help: "Whether a proxy rule is active for a subdomain (1 = active, 0 = removed)",
 	}, []string{"subdomain"})
 
-	// Request metrics by subdomain
+	// Request metrics by subdomain and backend
 	proxyRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "proxy_requests_total",
-		Help: "Total number of proxy requests by subdomain and status code",
-	}, []string{"subdomain", "status_code"})
+		Help: "Total number of proxy requests by subdomain, backend, and status code",
+	}, []string{"subdomain", "backend", "status_code"})
 
 	proxyRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "proxy_request_duration_seconds",
-		Help:    "Proxy request duration in seconds by subdomain",
+		Help:    "Proxy request duration in seconds by subdomain and backend",
 		Buckets: prometheus.DefBuckets, // 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10
-	}, []string{"subdomain"})
+	}, []string{"subdomain", "backend"})
 
-	// Last successful request timestamp by subdomain
+	// Last successful request timestamp by subdomain and backend
 	proxyLastRequestTimestamp = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "proxy_last_request_timestamp_seconds",
-		Help: "Timestamp of last successful proxy request by subdomain",
-	}, []string{"subdomain"})
+		Help: "Timestamp of last successful proxy request by subdomain and backend",
+	}, []string{"subdomain", "backend"})
 
 	// CSV reload metrics
 	proxyCSVReloadTotal = promauto.NewCounter(prometheus.CounterOpts{
@@ -91,18 +93,20 @@ var (
 )
 
 type ProxyRule struct {
-	ProxyTo    string
-	StripPath  bool
-	StripQuery bool
+	ProxyTo      string
+	StripPath    bool
+	StripQuery   bool
+	ExtraHeaders map[string]string
 }
 
 type ProxyService struct {
-	rules     atomic.Value // map[string]ProxyRule
-	csvPath   string
-	loadTime  atomic.Value // time.Time
-	ruleCount atomic.Int64
-	transport *http.Transport
-	proxies   sync.Map // map[string]*httputil.ReverseProxy - cached per backend
+	rules              atomic.Value // map[string][]ProxyRule - multiple backends per subdomain
+	csvPath            string
+	loadTime           atomic.Value // time.Time
+	ruleCount          atomic.Int64
+	transport          *http.Transport
+	proxies            sync.Map // map[string]*httputil.ReverseProxy - cached per backend
+	roundRobinCounters sync.Map // map[string]*atomic.Uint64 - round-robin counter per subdomain
 }
 
 type proxyMetadata struct {
@@ -110,6 +114,7 @@ type proxyMetadata struct {
 	startTime     time.Time
 	rule          ProxyRule
 	targetURL     *url.URL
+	backend       string // backend host for metrics (e.g., "akash.api.raidguild.com")
 	scheme        string
 	host          string
 	clientIP      string
@@ -139,7 +144,7 @@ func NewProxyService(csvPath string) *ProxyService {
 			DisableCompression:    true, // Don't decompress - just proxy as-is
 		},
 	}
-	s.rules.Store(make(map[string]ProxyRule))
+	s.rules.Store(make(map[string][]ProxyRule))
 	s.loadTime.Store(time.Now())
 	return s
 }
@@ -159,9 +164,10 @@ func (s *ProxyService) LoadRules() error {
 
 	reader := csv.NewReader(bufio.NewReader(file))
 	reader.TrimLeadingSpace = true
-	reader.FieldsPerRecord = 4
+	reader.FieldsPerRecord = -1 // Accept variable number of fields (4 or 5)
+	reader.LazyQuotes = true    // Allow lazy quote handling for JSON strings
 
-	newRules := make(map[string]ProxyRule)
+	newRules := make(map[string][]ProxyRule)
 	lineNum := 0
 
 	for {
@@ -178,6 +184,12 @@ func (s *ProxyService) LoadRules() error {
 
 		// Skip header
 		if lineNum == 1 && record[0] == "subdomain" {
+			continue
+		}
+
+		// Validate field count (4 or 5 columns)
+		if len(record) < 4 || len(record) > 5 {
+			log.Printf("WARN: Invalid field count at line %d (expected 4 or 5, got %d), skipping", lineNum, len(record))
 			continue
 		}
 
@@ -208,16 +220,36 @@ func (s *ProxyService) LoadRules() error {
 			stripQuery = false
 		}
 
-		newRules[subdomain] = ProxyRule{
-			ProxyTo:    proxyTo,
-			StripPath:  stripPath,
-			StripQuery: stripQuery,
+		// Parse extra_headers JSON (5th column, optional)
+		var extraHeaders map[string]string
+		if len(record) == 5 {
+			extraHeadersStr := strings.TrimSpace(record[4])
+			if extraHeadersStr != "" {
+				if err := json.Unmarshal([]byte(extraHeadersStr), &extraHeaders); err != nil {
+					log.Printf("WARN: Invalid extra_headers JSON for subdomain '%s' at line %d: %v, skipping extra headers", subdomain, lineNum, err)
+					extraHeaders = nil
+				}
+			}
 		}
+
+		// Append rule to subdomain's backend list
+		newRules[subdomain] = append(newRules[subdomain], ProxyRule{
+			ProxyTo:      proxyTo,
+			StripPath:    stripPath,
+			StripQuery:   stripQuery,
+			ExtraHeaders: extraHeaders,
+		})
 	}
 
 	if len(newRules) == 0 {
 		proxyCSVReloadErrorsTotal.Inc()
 		return fmt.Errorf("no valid proxy rules loaded from CSV")
+	}
+
+	// Count total backends across all subdomains
+	totalBackends := 0
+	for _, backends := range newRules {
+		totalBackends += len(backends)
 	}
 
 	// Atomic swap
@@ -227,7 +259,7 @@ func (s *ProxyService) LoadRules() error {
 	s.ruleCount.Store(int64(len(newRules)))
 
 	// Update Prometheus metrics
-	proxyRulesTotal.Set(float64(len(newRules)))
+	proxyRulesTotal.Set(float64(totalBackends))
 	proxyRulesLastLoadTimestamp.Set(float64(now.Unix()))
 
 	// Reset and update per-subdomain active metrics
@@ -236,24 +268,24 @@ func (s *ProxyService) LoadRules() error {
 		proxyRuleActive.WithLabelValues(subdomain).Set(1)
 	}
 
-	log.Printf("INFO: Loaded %d proxy rules from %s", len(newRules), s.csvPath)
+	log.Printf("INFO: Loaded %d subdomains with %d total backends from %s", len(newRules), totalBackends, s.csvPath)
 	return nil
 }
 
 // GetRules returns current rules (thread-safe)
-func (s *ProxyService) GetRules() map[string]ProxyRule {
-	return s.rules.Load().(map[string]ProxyRule)
+func (s *ProxyService) GetRules() map[string][]ProxyRule {
+	return s.rules.Load().(map[string][]ProxyRule)
 }
 
-// HandleProxy processes incoming requests and proxies them to the configured backend
-// Uses httputil.ReverseProxy for proper streaming support without buffering
+// HandleProxy processes incoming requests and proxies them to the configured backend(s)
+// Supports multiple backends per subdomain with round-robin load balancing and retry policies
 func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
 	// Extract subdomain from Host header
 	host := r.Host
 	if host == "" {
-		proxyRequestsTotal.WithLabelValues("unknown", "400").Inc()
+		proxyRequestsTotal.WithLabelValues("unknown", "unknown", "400").Inc()
 		http.Error(w, "Bad Request: Missing Host header", http.StatusBadRequest)
 		return
 	}
@@ -261,28 +293,19 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	// Parse subdomain (format: subdomain.api.pocket.network or subdomain.test-api.pocket.network)
 	parts := strings.Split(host, ".")
 	if len(parts) < 3 {
-		proxyRequestsTotal.WithLabelValues("unknown", "400").Inc()
+		proxyRequestsTotal.WithLabelValues("unknown", "unknown", "400").Inc()
 		http.Error(w, "Bad Request: Invalid hostname format", http.StatusBadRequest)
 		return
 	}
 
 	subdomain := parts[0]
 
-	// Lookup rule
+	// Lookup backends for subdomain
 	rules := s.GetRules()
-	rule, exists := rules[subdomain]
-	if !exists {
-		proxyRequestsTotal.WithLabelValues(subdomain, "404").Inc()
+	backends, exists := rules[subdomain]
+	if !exists || len(backends) == 0 {
+		proxyRequestsTotal.WithLabelValues(subdomain, "unknown", "404").Inc()
 		http.Error(w, "Not Found: No proxy rule for this subdomain", http.StatusNotFound)
-		return
-	}
-
-	// Parse backend URL (proxy_to must include scheme: http:// or https://)
-	targetURL, err := url.Parse(rule.ProxyTo)
-	if err != nil {
-		log.Printf("ERROR: Invalid proxy_to URL for subdomain '%s': %v", subdomain, err)
-		proxyRequestsTotal.WithLabelValues(subdomain, "500").Inc()
-		http.Error(w, "Internal Server Error: Invalid backend URL", http.StatusInternalServerError)
 		return
 	}
 
@@ -292,12 +315,64 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		clientIP = r.RemoteAddr
 	}
 
+	// Check retry policy from header
+	retryPolicy := strings.ToLower(strings.TrimSpace(r.Header.Get("Retry-Policy")))
+	if retryPolicy == "" {
+		retryPolicy = "fail-fast"
+	}
+
+	// Round-robin: get or create counter for this subdomain
+	counterVal, _ := s.roundRobinCounters.LoadOrStore(subdomain, &atomic.Uint64{})
+	counter := counterVal.(*atomic.Uint64)
+
+	if retryPolicy == "retry-all" && len(backends) > 1 {
+		// Try all backends until success (2xx) or all exhausted
+		for i := 0; i < len(backends); i++ {
+			idx := int(counter.Add(1)-1) % len(backends)
+			rule := backends[idx]
+
+			success, shouldReturn := s.tryBackend(w, r, subdomain, rule, start, host, clientIP, i == len(backends)-1)
+			if success || shouldReturn {
+				return
+			}
+			// Continue to next backend
+		}
+		// All backends failed - error already sent by last tryBackend call
+		return
+	}
+
+	// Default: fail-fast - use single backend via round-robin
+	idx := int(counter.Add(1)-1) % len(backends)
+	rule := backends[idx]
+	s.tryBackend(w, r, subdomain, rule, start, host, clientIP, true)
+}
+
+// tryBackend attempts to proxy to a single backend
+// Returns (success, shouldReturn) where:
+// - success: true if the request succeeded (2xx status)
+// - shouldReturn: true if we should stop trying more backends (error was written to response)
+func (s *ProxyService) tryBackend(w http.ResponseWriter, r *http.Request, subdomain string, rule ProxyRule, start time.Time, host string, clientIP string, isLastAttempt bool) (bool, bool) {
+	// Parse backend URL
+	targetURL, err := url.Parse(rule.ProxyTo)
+	if err != nil {
+		log.Printf("ERROR: Invalid proxy_to URL for subdomain '%s': %v", subdomain, err)
+		if isLastAttempt {
+			proxyRequestsTotal.WithLabelValues(subdomain, "unknown", "500").Inc()
+			http.Error(w, "Internal Server Error: Invalid backend URL", http.StatusInternalServerError)
+			return false, true
+		}
+		return false, false
+	}
+
+	backend := targetURL.Host
+
 	// Store all metadata in the request context
 	ctx := context.WithValue(r.Context(), proxyMetadataField, proxyMetadata{
 		subdomain:     subdomain,
 		startTime:     start,
 		rule:          rule,
 		targetURL:     targetURL,
+		backend:       backend,
 		scheme:        targetURL.Scheme,
 		host:          host,
 		clientIP:      clientIP,
@@ -314,89 +389,119 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		proxy = cached.(*httputil.ReverseProxy)
 	} else {
 		// Create a new reverse proxy
-		proxy = &httputil.ReverseProxy{
-			Director: func(req *http.Request) {
-				// Get metadata from context
-				meta, ok := req.Context().Value(proxyMetadataField).(proxyMetadata)
-				if !ok {
-					return
-				}
-
-				// Set backend URL
-				req.URL.Scheme = meta.targetURL.Scheme
-				req.URL.Host = meta.targetURL.Host
-				req.Host = meta.targetURL.Host
-
-				// Handle path
-				if meta.rule.StripPath {
-					req.URL.Path = meta.targetURL.Path
-				} else {
-					if meta.targetURL.Path != "" {
-						req.URL.Path = singleJoiningSlash(meta.targetURL.Path, meta.originalPath)
-					} else {
-						req.URL.Path = meta.originalPath
-					}
-				}
-
-				// Handle query string
-				if meta.rule.StripQuery {
-					req.URL.RawQuery = ""
-				} else if meta.targetURL.RawQuery != "" {
-					if meta.originalQuery != "" {
-						req.URL.RawQuery = meta.targetURL.RawQuery + "&" + meta.originalQuery
-					} else {
-						req.URL.RawQuery = meta.targetURL.RawQuery
-					}
-				} else {
-					req.URL.RawQuery = meta.originalQuery
-				}
-
-				// Add X-Forwarded-* headers (legacy, but widely supported)
-				if prior, ok := req.Header["X-Forwarded-For"]; ok {
-					req.Header.Set("X-Forwarded-For", strings.Join(prior, ", ")+", "+meta.clientIP)
-				} else {
-					req.Header.Set("X-Forwarded-For", meta.clientIP)
-				}
-				req.Header.Set("X-Real-IP", meta.clientIP)
-				req.Header.Set("X-Forwarded-Proto", meta.scheme)
-				req.Header.Set("X-Forwarded-Host", meta.host)
-
-				// Add standard Forwarded header (RFC 7239)
-				// Format: Forwarded: for=clientIP;host=originalHost;proto=scheme
-				forwardedValue := fmt.Sprintf("for=%s;host=%s;proto=%s", meta.clientIP, meta.host, meta.scheme)
-				if prior, ok := req.Header["Forwarded"]; ok {
-					// Append to the existing Forwarded header
-					req.Header.Set("Forwarded", strings.Join(prior, ", ")+", "+forwardedValue)
-				} else {
-					req.Header.Set("Forwarded", forwardedValue)
-				}
-			},
-			Transport: s.transport,
-			ModifyResponse: func(resp *http.Response) error {
-				// Get metadata from context
-				if meta, ok := resp.Request.Context().Value(proxyMetadataField).(proxyMetadata); ok {
-					statusCode := resp.StatusCode
-					proxyRequestsTotal.WithLabelValues(meta.subdomain, strconv.Itoa(statusCode)).Inc()
-					proxyRequestDuration.WithLabelValues(meta.subdomain).Observe(time.Since(meta.startTime).Seconds())
-					proxyLastRequestTimestamp.WithLabelValues(meta.subdomain).Set(float64(time.Now().Unix()))
-				}
-				return nil
-			},
-			ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
-				// Get metadata from context
-				if meta, ok := req.Context().Value(proxyMetadataField).(proxyMetadata); ok {
-					log.Printf("ERROR: Backend request failed for subdomain '%s': %v", meta.subdomain, err)
-					proxyRequestsTotal.WithLabelValues(meta.subdomain, "502").Inc()
-				}
-				http.Error(w, "Bad Gateway: Backend request failed", http.StatusBadGateway)
-			},
-			FlushInterval: -1, // Flush immediately for streaming
-		}
+		proxy = s.createReverseProxy()
 		s.proxies.Store(cacheKey, proxy)
 	}
 
-	// Serve the proxy request (this streams without buffering)
+	// For retry-all on non-last attempts, we need to capture the response to check status
+	if !isLastAttempt {
+		rec := httptest.NewRecorder()
+		proxy.ServeHTTP(rec, r)
+
+		// Check if successful (2xx status)
+		if rec.Code >= 200 && rec.Code < 300 {
+			// Success! Copy to real response writer
+			for k, v := range rec.Header() {
+				w.Header()[k] = v
+			}
+			w.WriteHeader(rec.Code)
+			w.Write(rec.Body.Bytes())
+			return true, true
+		}
+
+		// Failed, continue to next backend
+		log.Printf("WARN: Backend %s failed for subdomain '%s' with status %d, trying next backend", backend, subdomain, rec.Code)
+		return false, false
+	}
+
+	// Last attempt or fail-fast: serve directly (streaming)
 	proxy.ServeHTTP(w, r)
+	return true, true
+}
+
+// createReverseProxy creates a new httputil.ReverseProxy with custom Director, ModifyResponse, and ErrorHandler
+func (s *ProxyService) createReverseProxy() *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			// Get metadata from context
+			meta, ok := req.Context().Value(proxyMetadataField).(proxyMetadata)
+			if !ok {
+				return
+			}
+
+			// Set backend URL
+			req.URL.Scheme = meta.targetURL.Scheme
+			req.URL.Host = meta.targetURL.Host
+			req.Host = meta.targetURL.Host
+
+			// Handle path
+			if meta.rule.StripPath {
+				req.URL.Path = meta.targetURL.Path
+			} else {
+				if meta.targetURL.Path != "" {
+					req.URL.Path = singleJoiningSlash(meta.targetURL.Path, meta.originalPath)
+				} else {
+					req.URL.Path = meta.originalPath
+				}
+			}
+
+			// Handle query string
+			if meta.rule.StripQuery {
+				req.URL.RawQuery = ""
+			} else if meta.targetURL.RawQuery != "" {
+				if meta.originalQuery != "" {
+					req.URL.RawQuery = meta.targetURL.RawQuery + "&" + meta.originalQuery
+				} else {
+					req.URL.RawQuery = meta.targetURL.RawQuery
+				}
+			} else {
+				req.URL.RawQuery = meta.originalQuery
+			}
+
+			// Apply extra headers from backend config
+			for k, v := range meta.rule.ExtraHeaders {
+				req.Header.Set(k, v)
+			}
+
+			// Add X-Forwarded-* headers (legacy, but widely supported)
+			if prior, ok := req.Header["X-Forwarded-For"]; ok {
+				req.Header.Set("X-Forwarded-For", strings.Join(prior, ", ")+", "+meta.clientIP)
+			} else {
+				req.Header.Set("X-Forwarded-For", meta.clientIP)
+			}
+			req.Header.Set("X-Real-IP", meta.clientIP)
+			req.Header.Set("X-Forwarded-Proto", meta.scheme)
+			req.Header.Set("X-Forwarded-Host", meta.host)
+
+			// Add standard Forwarded header (RFC 7239)
+			forwardedValue := fmt.Sprintf("for=%s;host=%s;proto=%s", meta.clientIP, meta.host, meta.scheme)
+			if prior, ok := req.Header["Forwarded"]; ok {
+				req.Header.Set("Forwarded", strings.Join(prior, ", ")+", "+forwardedValue)
+			} else {
+				req.Header.Set("Forwarded", forwardedValue)
+			}
+		},
+		Transport: s.transport,
+		ModifyResponse: func(resp *http.Response) error {
+			// Get metadata from context and update metrics
+			if meta, ok := resp.Request.Context().Value(proxyMetadataField).(proxyMetadata); ok {
+				statusCode := resp.StatusCode
+				proxyRequestsTotal.WithLabelValues(meta.subdomain, meta.backend, strconv.Itoa(statusCode)).Inc()
+				proxyRequestDuration.WithLabelValues(meta.subdomain, meta.backend).Observe(time.Since(meta.startTime).Seconds())
+				proxyLastRequestTimestamp.WithLabelValues(meta.subdomain, meta.backend).Set(float64(time.Now().Unix()))
+			}
+			return nil
+		},
+		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
+			// Get metadata from context
+			if meta, ok := req.Context().Value(proxyMetadataField).(proxyMetadata); ok {
+				log.Printf("ERROR: Backend request failed for subdomain '%s' backend '%s': %v", meta.subdomain, meta.backend, err)
+				proxyRequestsTotal.WithLabelValues(meta.subdomain, meta.backend, "502").Inc()
+			}
+			http.Error(w, "Bad Gateway: Backend request failed", http.StatusBadGateway)
+		},
+		FlushInterval: -1, // Flush immediately for streaming
+	}
 }
 
 // singleJoiningSlash joins two URL paths with a single slash

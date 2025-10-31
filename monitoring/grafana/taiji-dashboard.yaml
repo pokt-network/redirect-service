@@ -1,0 +1,416 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: taiji-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  taiji-dashboard.json: |-
+    {
+      "annotations": {"list": []},
+      "description": "Taiji reverse proxy monitoring with multi-backend support",
+      "editable": true,
+      "gnetId": null,
+      "graphTooltip": 1,
+      "id": null,
+      "links": [],
+      "panels": [
+        {
+          "collapsed": false,
+          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+          "id": 100,
+          "panels": [],
+          "title": "Service Health",
+          "type": "row"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "mappings": [{"options": {"0": {"color": "red", "text": "DOWN"}, "1": {"color": "green", "text": "UP"}}, "type": "value"}],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}
+            }
+          },
+          "gridPos": {"h": 5, "w": 4, "x": 0, "y": 1},
+          "id": 1,
+          "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
+          "pluginVersion": "9.0.0",
+          "targets": [{"expr": "min(up{job=\"taiji\"})", "refId": "A"}],
+          "title": "Status",
+          "type": "stat"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
+              "unit": "short"
+            }
+          },
+          "gridPos": {"h": 5, "w": 4, "x": 4, "y": 1},
+          "id": 2,
+          "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
+          "pluginVersion": "9.0.0",
+          "targets": [{"expr": "max(proxy_rules_total)", "refId": "A"}],
+          "title": "Total Backends",
+          "type": "stat"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "decimals": 2,
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 50}, {"color": "orange", "value": 100}]},
+              "unit": "reqps"
+            }
+          },
+          "gridPos": {"h": 5, "w": 4, "x": 8, "y": 1},
+          "id": 3,
+          "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
+          "pluginVersion": "9.0.0",
+          "targets": [{"expr": "sum(rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "refId": "A"}],
+          "title": "Request Rate",
+          "type": "stat"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "decimals": 3,
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.01}, {"color": "orange", "value": 0.05}, {"color": "red", "value": 0.1}]},
+              "unit": "s"
+            }
+          },
+          "gridPos": {"h": 5, "w": 4, "x": 12, "y": 1},
+          "id": 4,
+          "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
+          "pluginVersion": "9.0.0",
+          "targets": [{"expr": "histogram_quantile(0.99, sum(rate(proxy_request_duration_seconds_bucket{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])) by (le))", "refId": "A"}],
+          "title": "P99 Latency",
+          "type": "stat"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "decimals": 2,
+              "mappings": [],
+              "max": 1,
+              "min": 0,
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.01}, {"color": "orange", "value": 0.05}, {"color": "red", "value": 0.1}]},
+              "unit": "percentunit"
+            }
+          },
+          "gridPos": {"h": 5, "w": 4, "x": 16, "y": 1},
+          "id": 5,
+          "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
+          "pluginVersion": "9.0.0",
+          "targets": [{"expr": "sum(rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"4..|5..\"}[5m])) / sum(rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "refId": "A"}],
+          "title": "Error Rate",
+          "type": "stat"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "decimals": 0,
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
+              "unit": "short"
+            }
+          },
+          "gridPos": {"h": 5, "w": 4, "x": 20, "y": 1},
+          "id": 6,
+          "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
+          "pluginVersion": "9.0.0",
+          "targets": [{"expr": "sum(increase(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[24h]))", "refId": "A"}],
+          "title": "24h Requests",
+          "type": "stat"
+        },
+        {
+          "collapsed": false,
+          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 6},
+          "id": 101,
+          "panels": [],
+          "title": "Traffic & Performance",
+          "type": "row"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "reqps"
+            }
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 7},
+          "id": 10,
+          "options": {"legend": {"calcs": ["mean", "max", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"expr": "sum by (subdomain) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m]))", "legendFormat": "{{subdomain}}", "refId": "A"}],
+          "title": "Request Rate by Subdomain",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "reqps"
+            }
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 7},
+          "id": 30,
+          "options": {"legend": {"calcs": ["mean", "max", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"expr": "sum by (subdomain, backend) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m]))", "legendFormat": "{{subdomain}} - {{backend}}", "refId": "A"}],
+          "title": "Request Rate by Backend",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "s"
+            }
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 15},
+          "id": 11,
+          "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])))", "legendFormat": "{{subdomain}} - p99", "refId": "A"},
+            {"expr": "histogram_quantile(0.95, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])))", "legendFormat": "{{subdomain}} - p95", "refId": "B"},
+            {"expr": "histogram_quantile(0.50, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])))", "legendFormat": "{{subdomain}} - p50", "refId": "C"}
+          ],
+          "title": "Latency Percentiles by Subdomain",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "s"
+            }
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 15},
+          "id": 31,
+          "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "histogram_quantile(0.99, sum by (subdomain, backend, le) (rate(proxy_request_duration_seconds_bucket{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])))", "legendFormat": "{{subdomain}}/{{backend}} - p99", "refId": "A"}
+          ],
+          "title": "P99 Latency by Backend",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "custom": {"align": "left", "displayMode": "auto", "filterable": true},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "text", "value": null}]},
+              "unit": "short"
+            },
+            "overrides": [
+              {"matcher": {"id": "byName", "options": "Requests/sec"}, "properties": [{"id": "custom.displayMode", "value": "gradient-gauge"}, {"id": "decimals", "value": 2}, {"id": "custom.width", "value": 150}]},
+              {"matcher": {"id": "byName", "options": "Backend"}, "properties": [{"id": "custom.width", "value": 300}]}
+            ]
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 23},
+          "id": 12,
+          "options": {"footer": {"fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": true, "displayName": "Requests/sec"}]},
+          "targets": [{"expr": "sum by (subdomain, backend) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "format": "table", "instant": true, "refId": "A"}],
+          "title": "Backend Traffic Ranking",
+          "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true}, "indexByName": {}, "renameByName": {"Value": "Requests/sec", "backend": "Backend", "subdomain": "Subdomain"}}}],
+          "type": "table"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "normal"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "reqps"
+            }
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 23},
+          "id": 13,
+          "options": {"legend": {"calcs": ["mean", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"expr": "sum by (status_code) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "legendFormat": "{{status_code}}", "refId": "A"}],
+          "title": "Status Codes",
+          "type": "timeseries"
+        },
+        {
+          "collapsed": false,
+          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 31},
+          "id": 102,
+          "panels": [],
+          "title": "Backend Health",
+          "type": "row"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "max": 1,
+              "min": 0,
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 0.05}]},
+              "unit": "percentunit"
+            }
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+          "id": 32,
+          "options": {"legend": {"calcs": ["mean", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"expr": "sum by (subdomain, backend) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"5..\"}[5m])) / sum by (subdomain, backend) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "legendFormat": "{{subdomain}}/{{backend}}", "refId": "A"}],
+          "title": "5xx Error Rate by Backend",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "reqps"
+            }
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+          "id": 33,
+          "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"expr": "sum by (subdomain, backend) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=\"502\"}[5m]))", "legendFormat": "{{subdomain}}/{{backend}}", "refId": "A"}],
+          "title": "502 Errors (Backend Down)",
+          "type": "timeseries"
+        },
+        {
+          "collapsed": false,
+          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 40},
+          "id": 103,
+          "panels": [],
+          "title": "Configuration",
+          "type": "row"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 100, "gradientMode": "none", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [{"options": {"0": {"color": "red", "text": "Inactive"}, "1": {"color": "green", "text": "Active"}}, "type": "value"}],
+              "max": 1,
+              "min": 0,
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "short"
+            }
+          },
+          "gridPos": {"h": 7, "w": 12, "x": 0, "y": 41},
+          "id": 20,
+          "options": {"legend": {"calcs": ["last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+          "targets": [{"expr": "max by (subdomain) (proxy_rule_active{subdomain=~\"$subdomain\"})", "legendFormat": "{{subdomain}}", "refId": "A"}],
+          "title": "Rule Status",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "stepAfter", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "ops"
+            },
+            "overrides": [
+              {"matcher": {"id": "byName", "options": "Errors"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]},
+              {"matcher": {"id": "byName", "options": "Attempts"}, "properties": [{"id": "color", "value": {"fixedColor": "blue", "mode": "fixed"}}]}
+            ]
+          },
+          "gridPos": {"h": 7, "w": 12, "x": 12, "y": 41},
+          "id": 21,
+          "options": {"legend": {"calcs": ["sum", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+          "targets": [{"expr": "rate(proxy_csv_reload_total[5m])", "legendFormat": "Attempts", "refId": "A"}, {"expr": "rate(proxy_csv_reload_errors_total[5m])", "legendFormat": "Errors", "refId": "B"}],
+          "title": "CSV Reloads",
+          "type": "timeseries"
+        }
+      ],
+      "refresh": "30s",
+      "schemaVersion": 36,
+      "style": "dark",
+      "tags": ["taiji", "proxy", "multi-backend"],
+      "templating": {
+        "list": [
+          {
+            "allValue": ".*",
+            "current": {"selected": true, "text": "All", "value": "$__all"},
+            "datasource": "Prometheus",
+            "definition": "label_values(proxy_requests_total, subdomain)",
+            "description": "Filter by subdomain",
+            "hide": 0,
+            "includeAll": true,
+            "label": "Subdomain",
+            "multi": true,
+            "name": "subdomain",
+            "options": [],
+            "query": {"query": "label_values(proxy_requests_total, subdomain)", "refId": "StandardVariableQuery"},
+            "refresh": 2,
+            "regex": "",
+            "skipUrlSync": false,
+            "sort": 1,
+            "type": "query"
+          },
+          {
+            "allValue": ".*",
+            "current": {"selected": true, "text": "All", "value": "$__all"},
+            "datasource": "Prometheus",
+            "definition": "label_values(proxy_requests_total, backend)",
+            "description": "Filter by backend",
+            "hide": 0,
+            "includeAll": true,
+            "label": "Backend",
+            "multi": true,
+            "name": "backend",
+            "options": [],
+            "query": {"query": "label_values(proxy_requests_total, backend)", "refId": "StandardVariableQuery"},
+            "refresh": 2,
+            "regex": "",
+            "skipUrlSync": false,
+            "sort": 1,
+            "type": "query"
+          }
+        ]
+      },
+      "time": {"from": "now-1h", "to": "now"},
+      "timepicker": {"refresh_intervals": ["10s", "30s", "1m", "5m", "15m", "30m", "1h"]},
+      "timezone": "browser",
+      "title": "Taiji Reverse Proxy (Multi-Backend)",
+      "uid": "taiji",
+      "version": 3
+    }

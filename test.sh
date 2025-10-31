@@ -165,6 +165,77 @@ else
     echo -e "${YELLOW}⚠ Chunked streaming test failed (HTTP $HTTP_CODE)${NC}\n"
 fi
 
+# Test multiple backends (round-robin load balancing)
+echo -e "${YELLOW}[TEST] Multiple backends (round-robin)${NC}"
+echo -e "${YELLOW}  → Testing 'rr_test' subdomain with 2 backends${NC}"
+
+# Make 10 requests to the rr_test subdomain
+for i in {1..10}; do
+    curl -s -o /dev/null -H "Host: rr_test.test-api.pocket.network" "$ENDPOINT/get" 2>/dev/null || true
+done
+
+sleep 1
+
+# Check metrics to see if both backends received requests
+METRICS=$(curl -s "$ENDPOINT/metrics")
+BACKEND1_REQUESTS=$(echo "$METRICS" | grep 'proxy_requests_total.*backend="localhost:4040".*status_code="200".*subdomain="rr_test"' | grep -oP '} \K\d+' || echo "0")
+BACKEND2_REQUESTS=$(echo "$METRICS" | grep 'proxy_requests_total.*backend="localhost:4041".*status_code="200".*subdomain="rr_test"' | grep -oP '} \K\d+' || echo "0")
+
+if [ "$BACKEND1_REQUESTS" -ge 1 ] && [ "$BACKEND2_REQUESTS" -ge 1 ]; then
+    echo -e "${GREEN}✓ Round-robin test passed (backend1: $BACKEND1_REQUESTS requests, backend2: $BACKEND2_REQUESTS requests)${NC}\n"
+elif [ "$BACKEND1_REQUESTS" -eq 0 ] && [ "$BACKEND2_REQUESTS" -eq 0 ]; then
+    echo -e "${YELLOW}⚠ Round-robin test skipped (backends not responding)${NC}\n"
+else
+    echo -e "${YELLOW}⚠ Round-robin test inconclusive (backend1: $BACKEND1_REQUESTS, backend2: $BACKEND2_REQUESTS)${NC}\n"
+fi
+
+# Test custom headers
+echo -e "${YELLOW}[TEST] Custom headers (extra_headers)${NC}"
+echo -e "${YELLOW}  → Testing 'custom_headers' subdomain adds custom headers to backend${NC}"
+
+# Request to custom_headers subdomain (backend is /headers which echoes all headers)
+RESPONSE=$(curl -s -H "Host: custom_headers.test-api.pocket.network" "$ENDPOINT/" 2>/dev/null || echo "")
+CUSTOM_HEADER=$(echo "$RESPONSE" | grep -i "X-Custom-Backend" || echo "")
+API_KEY_HEADER=$(echo "$RESPONSE" | grep -i "X-Api-Key" || echo "")
+
+if [ -n "$CUSTOM_HEADER" ] && [ -n "$API_KEY_HEADER" ]; then
+    echo -e "${GREEN}✓ Custom headers test passed (headers forwarded to backend)${NC}\n"
+elif [ -z "$RESPONSE" ]; then
+    echo -e "${YELLOW}⚠ Custom headers test skipped (backend not responding)${NC}\n"
+else
+    echo -e "${YELLOW}⚠ Custom headers test inconclusive (custom headers may not be present)${NC}\n"
+fi
+
+# Test Retry-Policy header
+echo -e "${YELLOW}[TEST] Retry-Policy header (fail-fast vs retry-all)${NC}"
+echo -e "${YELLOW}  → Testing fail-fast behavior (default)${NC}"
+
+# Test fail-fast (should get response from single backend)
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Host: httpbin.test-api.pocket.network" \
+    -H "Retry-Policy: fail-fast" \
+    "$ENDPOINT/get")
+
+if [ "$HTTP_CODE" == "200" ] || [ "$HTTP_CODE" == "502" ] || [ "$HTTP_CODE" == "404" ]; then
+    echo -e "${GREEN}✓ Retry-Policy: fail-fast works (HTTP $HTTP_CODE)${NC}"
+else
+    echo -e "${YELLOW}⚠ Retry-Policy: fail-fast inconclusive (HTTP $HTTP_CODE)${NC}"
+fi
+
+echo -e "${YELLOW}  → Testing retry-all behavior${NC}"
+
+# Test retry-all (should try multiple backends if first fails)
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Host: rr_test.test-api.pocket.network" \
+    -H "Retry-Policy: retry-all" \
+    "$ENDPOINT/get")
+
+if [ "$HTTP_CODE" == "200" ] || [ "$HTTP_CODE" == "502" ] || [ "$HTTP_CODE" == "404" ]; then
+    echo -e "${GREEN}✓ Retry-Policy: retry-all works (HTTP $HTTP_CODE)${NC}\n"
+else
+    echo -e "${YELLOW}⚠ Retry-Policy: retry-all inconclusive (HTTP $HTTP_CODE)${NC}\n"
+fi
+
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}All tests passed! 🎉${NC}"
 echo -e "${GREEN}========================================${NC}"

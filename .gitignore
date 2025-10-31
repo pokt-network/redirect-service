@@ -25,3 +25,4 @@ Thumbs.db
 # Local development
 /tmp/
 *.local.csv
+proxies.csv
