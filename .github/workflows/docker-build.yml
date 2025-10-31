@@ -94,6 +94,17 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Extract tag annotation
+        id: tag_annotation
+        run: |
+          TAG_MESSAGE=$(git tag -l --format='%(contents)' ${{ steps.version.outputs.VERSION }})
+          # Use multiline output for GitHub Actions
+          {
+            echo 'TAG_MESSAGE<<EOF'
+            echo "$TAG_MESSAGE"
+            echo EOF
+          } >> $GITHUB_OUTPUT
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2.3.3
         with:
@@ -104,6 +115,10 @@ jobs:
             taiji-${{ steps.version.outputs.VERSION }}-darwin-amd64
             taiji-${{ steps.version.outputs.VERSION }}-darwin-arm64
           body: |
+            ${{ steps.tag_annotation.outputs.TAG_MESSAGE }}
+
+            ---
+
             ## Docker Image
 
             ```bash

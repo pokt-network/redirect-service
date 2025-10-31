@@ -359,6 +359,100 @@ data:
           "targets": [{"expr": "rate(proxy_csv_reload_total[5m])", "legendFormat": "Attempts", "refId": "A"}, {"expr": "rate(proxy_csv_reload_errors_total[5m])", "legendFormat": "Errors", "refId": "B"}],
           "title": "CSV Reloads",
           "type": "timeseries"
+        },
+        {
+          "collapsed": false,
+          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 48},
+          "id": 400,
+          "panels": [],
+          "title": "Retry & Rate Limiting",
+          "type": "row"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "normal"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "reqps"
+            },
+            "overrides": [
+              {"matcher": {"id": "byName", "options": "success"}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]},
+              {"matcher": {"id": "byName", "options": "all_failed"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]}
+            ]
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 49},
+          "id": 401,
+          "options": {"legend": {"calcs": ["sum", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "sum by (subdomain, outcome) (rate(proxy_retry_attempts_total{subdomain=~\"$subdomain\"}[5m]))", "legendFormat": "{{subdomain}}: {{outcome}}", "refId": "A"}
+          ],
+          "title": "Retry Rate by Subdomain",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.5}, {"color": "red", "value": 1}]},
+              "unit": "reqps"
+            }
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 49},
+          "id": 402,
+          "options": {"legend": {"calcs": ["sum", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "sum by (subdomain, backend) (rate(proxy_backend_failures_total{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "legendFormat": "{{subdomain}}/{{backend}}", "refId": "A"}
+          ],
+          "title": "Backend Failure Rate (Triggers Retries)",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 0.1}, {"color": "red", "value": 0.5}]},
+              "unit": "reqps"
+            }
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 57},
+          "id": 403,
+          "options": {"legend": {"calcs": ["sum", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "sum by (subdomain, backend) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=\"429\"}[5m]))", "legendFormat": "{{subdomain}}/{{backend}}", "refId": "A"}
+          ],
+          "title": "Rate Limit Errors (429) by Backend",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "mappings": [],
+              "max": 1,
+              "min": 0,
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.1}, {"color": "orange", "value": 0.5}, {"color": "red", "value": 0.8}]},
+              "unit": "percentunit"
+            }
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 57},
+          "id": 404,
+          "options": {"displayMode": "gradient", "minVizHeight": 10, "minVizWidth": 0, "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "showUnfilled": true},
+          "pluginVersion": "9.0.0",
+          "targets": [
+            {"expr": "sum by (subdomain, backend) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=\"429\"}[10m])) / sum by (subdomain, backend) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\"}[10m]))", "legendFormat": "{{subdomain}}/{{backend}}", "refId": "A"}
+          ],
+          "title": "Rate Limit Error Percentage by Backend",
+          "type": "bargauge"
         }
       ],
       "refresh": "30s",

@@ -195,19 +195,6 @@ spec:
         summary: "Taiji file watcher restarting frequently"
         description: "Taiji file watcher has restarted {{ printf \"%.0f\" $value }} times in the last 30 minutes on instance {{ $labels.instance }}."
 
-    # Warning: Low request rate (possible issue) - Fixed formatting!
-    - alert: TaijiLowTraffic
-      expr: |
-        sum(rate(proxy_requests_total{job="taiji"}[5m])) < 0.1
-      for: 15m
-      labels:
-        severity: warning
-        service: taiji
-        cluster: pnf-cluster
-      annotations:
-        summary: "Taiji service experiencing unusually low traffic"
-        description: "Taiji is receiving only {{ printf \"%.4f\" $value }} requests per second ({{ printf \"%.2f\" (mul $value 60) }} requests/min), which may indicate an upstream routing issue."
-
     # Critical: Subdomain backend completely failing
     - alert: TaijiSubdomainBackendDown
       expr: |
@@ -257,3 +244,78 @@ spec:
       annotations:
         summary: "Taiji backend {{ $labels.backend }} is consistently slow"
         description: "Backend {{ $labels.backend }} for subdomain {{ $labels.subdomain }} has P50 latency of {{ $value | humanizeDuration }}, indicating performance degradation."
+
+    # Warning: High retry rate
+    - alert: TaijiHighRetryRate
+      expr: |
+        sum by (subdomain) (rate(proxy_retry_attempts_total{job="taiji"}[10m])) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji subdomain {{ $labels.subdomain }} has high retry rate"
+        description: "Subdomain {{ $labels.subdomain }} is retrying {{ printf \"%.2f\" $value }} requests per second, indicating backend instability."
+
+    # Critical: All retries failing
+    - alert: TaijiAllRetriesFailing
+      expr: |
+        (
+          sum by (subdomain) (rate(proxy_retry_attempts_total{job="taiji",outcome="all_failed"}[10m]))
+          /
+          sum by (subdomain) (rate(proxy_retry_attempts_total{job="taiji"}[10m]))
+        ) > 0.8
+        and
+        sum by (subdomain) (rate(proxy_retry_attempts_total{job="taiji"}[10m])) > 0.1
+      for: 5m
+      labels:
+        severity: critical
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji subdomain {{ $labels.subdomain }} retries consistently failing"
+        description: "Subdomain {{ $labels.subdomain }} has {{ $value | humanizePercentage }} of retries failing, indicating all backends may be down."
+
+    # Warning: Backend experiencing frequent failures
+    - alert: TaijiBackendFrequentFailures
+      expr: |
+        sum by (subdomain, backend) (rate(proxy_backend_failures_total{job="taiji"}[10m])) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji backend {{ $labels.backend }} frequently failing"
+        description: "Backend {{ $labels.backend }} for subdomain {{ $labels.subdomain }} is failing {{ printf \"%.2f\" $value }} requests per second, triggering retries."
+
+    # Warning: Backend hitting rate limits
+    - alert: TaijiBackendRateLimited
+      expr: |
+        sum by (subdomain, backend) (rate(proxy_requests_total{job="taiji",status_code="429"}[10m])) > 0.1
+      for: 10m
+      labels:
+        severity: warning
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji backend {{ $labels.backend }} being rate limited"
+        description: "Backend {{ $labels.backend }} for subdomain {{ $labels.subdomain }} is returning {{ printf \"%.2f\" $value }} rate limit (429) responses per second. Consider adding more backends or reducing traffic."
+
+    # Critical: Backend heavily rate limited
+    - alert: TaijiBackendHeavilyRateLimited
+      expr: |
+        (
+          sum by (subdomain, backend) (rate(proxy_requests_total{job="taiji",status_code="429"}[5m]))
+          /
+          sum by (subdomain, backend) (rate(proxy_requests_total{job="taiji"}[5m]))
+        ) > 0.20
+      for: 5m
+      labels:
+        severity: critical
+        service: taiji
+        cluster: pnf-cluster
+      annotations:
+        summary: "Taiji backend {{ $labels.backend }} heavily rate limited"
+        description: "Backend {{ $labels.backend }} for subdomain {{ $labels.subdomain }} has {{ $value | humanizePercentage }} rate limit errors, significantly impacting service quality."

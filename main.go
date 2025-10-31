@@ -90,6 +90,17 @@ var (
 		Name: "proxy_watcher_restarts_total",
 		Help: "Total number of file watcher restarts",
 	})
+
+	// Retry metrics
+	proxyRetryAttemptsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "proxy_retry_attempts_total",
+		Help: "Total number of backend retry attempts by subdomain and outcome",
+	}, []string{"subdomain", "outcome"}) // outcome: "success" or "all_failed"
+
+	proxyBackendFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "proxy_backend_failures_total",
+		Help: "Total number of backend failures that triggered retries by subdomain and backend",
+	}, []string{"subdomain", "backend"})
 )
 
 type ProxyRule struct {
@@ -315,10 +326,10 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		clientIP = r.RemoteAddr
 	}
 
-	// Check retry policy from header
+	// Check retry policy from header (default: retry-all)
 	retryPolicy := strings.ToLower(strings.TrimSpace(r.Header.Get("Retry-Policy")))
 	if retryPolicy == "" {
-		retryPolicy = "fail-fast"
+		retryPolicy = "retry-all"
 	}
 
 	// Round-robin: get or create counter for this subdomain
@@ -327,17 +338,32 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 
 	if retryPolicy == "retry-all" && len(backends) > 1 {
 		// Try all backends until success (2xx) or all exhausted
+		attemptCount := 0
 		for i := 0; i < len(backends); i++ {
 			idx := int(counter.Add(1)-1) % len(backends)
 			rule := backends[idx]
 
-			success, shouldReturn := s.tryBackend(w, r, subdomain, rule, start, host, clientIP, i == len(backends)-1)
-			if success || shouldReturn {
+			success, _, shouldReturn := s.tryBackend(w, r, subdomain, rule, start, host, clientIP, i == len(backends)-1)
+			attemptCount++
+
+			if success {
+				// Track retry outcome - successful after trying multiple backends
+				if attemptCount > 1 {
+					proxyRetryAttemptsTotal.WithLabelValues(subdomain, "success").Inc()
+				}
+				return
+			}
+
+			if shouldReturn {
+				// This was the last attempt and it failed
+				if attemptCount > 1 {
+					proxyRetryAttemptsTotal.WithLabelValues(subdomain, "all_failed").Inc()
+				}
 				return
 			}
 			// Continue to next backend
 		}
-		// All backends failed - error already sent by last tryBackend call
+		// All backends exhausted without response (shouldn't reach here)
 		return
 	}
 
@@ -348,10 +374,11 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 }
 
 // tryBackend attempts to proxy to a single backend
-// Returns (success, shouldReturn) where:
+// Returns (success, statusCode, shouldReturn) where:
 // - success: true if the request succeeded (2xx status)
+// - statusCode: the HTTP status code returned by the backend (0 if error before proxy)
 // - shouldReturn: true if we should stop trying more backends (error was written to response)
-func (s *ProxyService) tryBackend(w http.ResponseWriter, r *http.Request, subdomain string, rule ProxyRule, start time.Time, host string, clientIP string, isLastAttempt bool) (bool, bool) {
+func (s *ProxyService) tryBackend(w http.ResponseWriter, r *http.Request, subdomain string, rule ProxyRule, start time.Time, host string, clientIP string, isLastAttempt bool) (bool, int, bool) {
 	// Parse backend URL
 	targetURL, err := url.Parse(rule.ProxyTo)
 	if err != nil {
@@ -359,9 +386,9 @@ func (s *ProxyService) tryBackend(w http.ResponseWriter, r *http.Request, subdom
 		if isLastAttempt {
 			proxyRequestsTotal.WithLabelValues(subdomain, "unknown", "500").Inc()
 			http.Error(w, "Internal Server Error: Invalid backend URL", http.StatusInternalServerError)
-			return false, true
+			return false, 500, true
 		}
-		return false, false
+		return false, 0, false
 	}
 
 	backend := targetURL.Host
@@ -406,17 +433,42 @@ func (s *ProxyService) tryBackend(w http.ResponseWriter, r *http.Request, subdom
 			}
 			w.WriteHeader(rec.Code)
 			w.Write(rec.Body.Bytes())
-			return true, true
+			return true, rec.Code, true
 		}
 
-		// Failed, continue to next backend
-		log.Printf("WARN: Backend %s failed for subdomain '%s' with status %d, trying next backend", backend, subdomain, rec.Code)
-		return false, false
+		// Check if error is retryable (5xx or 429 rate limit)
+		isRetryable := rec.Code >= 500 || rec.Code == 429
+		if !isRetryable {
+			// 4xx client error (except 429) - don't retry, return immediately
+			for k, v := range rec.Header() {
+				w.Header()[k] = v
+			}
+			w.WriteHeader(rec.Code)
+			w.Write(rec.Body.Bytes())
+			log.Printf("INFO: Backend %s returned non-retryable status %d for subdomain '%s', not retrying", backend, rec.Code, subdomain)
+			return false, rec.Code, true
+		}
+
+		// Retryable error (5xx or 429), track backend failure and continue to next backend
+		proxyBackendFailuresTotal.WithLabelValues(subdomain, backend).Inc()
+		log.Printf("WARN: Backend %s failed for subdomain '%s' with status %d (retryable), trying next backend", backend, subdomain, rec.Code)
+		return false, rec.Code, false
 	}
 
-	// Last attempt or fail-fast: serve directly (streaming)
-	proxy.ServeHTTP(w, r)
-	return true, true
+	// Last attempt or fail-fast: use recorder to capture status code
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, r)
+
+	// Copy to real response writer
+	for k, v := range rec.Header() {
+		w.Header()[k] = v
+	}
+	w.WriteHeader(rec.Code)
+	w.Write(rec.Body.Bytes())
+
+	// Return success only if 2xx
+	success := rec.Code >= 200 && rec.Code < 300
+	return success, rec.Code, true
 }
 
 // createReverseProxy creates a new httputil.ReverseProxy with custom Director, ModifyResponse, and ErrorHandler
