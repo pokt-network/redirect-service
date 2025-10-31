@@ -1,7 +1,9 @@
-subdomain,proxy_to,strip_path,strip_query,extra_headers
-httpbin_strip,http://localhost:4040/get,true,true,""
-httpbin_path,http://localhost:4040/anything,false,true,""
-httpbin,http://localhost:4040,false,false,""
-rr_test,http://localhost:4040,false,false,""
-rr_test,http://localhost:4041,false,false,""
-custom_headers,http://localhost:4040/headers,true,false,"{""X-Custom-Backend"": ""backend-with-headers"", ""X-API-Key"": ""secret123""}"
+subdomain,proxy_to,strip_path,strip_query,extra_headers,rate_limit
+httpbin_strip,http://localhost:4040/get,true,true,"",""
+httpbin_path,http://localhost:4040/anything,false,true,"",""
+httpbin,http://localhost:4040,false,false,"",""
+rr_test,http://localhost:4040,false,false,"",""
+rr_test,http://localhost:4041,false,false,"",""
+custom_headers,http://localhost:4040/headers,true,false,"{""X-Custom-Backend"": ""backend-with-headers"", ""X-API-Key"": ""secret123""}",""
+rate_limited,http://localhost:4040,false,false,"",10/1m
+rate_generous,http://localhost:4040,false,false,"",1000/1h

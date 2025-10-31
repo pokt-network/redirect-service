@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,16 +29,37 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
 )
 
 // contextKey is a custom type for context keys to avoid collisions
 type contextKey string
 
 const (
-	defaultCSVPath     = "examples/proxies.csv"
-	defaultPort        = "8080"
-	proxyMetadataField = contextKey("proxy_metadata")
+	defaultCSVPath        = "examples/proxies.csv"
+	defaultPort           = "8080"
+	proxyMetadataField    = contextKey("proxy_metadata")
+	backendStartTimeField = contextKey("backend_start_time")
 )
+
+// Pre-allocated status code strings to avoid allocations in hot path
+var statusCodeStrings = map[int]string{
+	200: "200",
+	400: "400",
+	404: "404",
+	429: "429",
+	500: "500",
+	502: "502",
+	503: "503",
+}
+
+// statusCodeToString converts status code to string using pre-allocated strings when possible
+func statusCodeToString(code int) string {
+	if s, ok := statusCodeStrings[code]; ok {
+		return s
+	}
+	return strconv.Itoa(code)
+}
 
 var (
 	// Prometheus metrics
@@ -65,8 +87,20 @@ var (
 
 	proxyRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "proxy_request_duration_seconds",
-		Help:    "Proxy request duration in seconds by subdomain and backend",
+		Help:    "Total proxy request duration in seconds (includes rate limiting, routing, backend, response) by subdomain and backend",
 		Buckets: prometheus.DefBuckets, // 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10
+	}, []string{"subdomain", "backend"})
+
+	proxyBackendDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "proxy_backend_duration_seconds",
+		Help:    "Backend response time in seconds (time from sending request to backend until response received) by subdomain and backend",
+		Buckets: prometheus.DefBuckets, // 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10
+	}, []string{"subdomain", "backend"})
+
+	proxyOverheadDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "proxy_overhead_duration_seconds",
+		Help:    "Taiji proxy overhead in seconds (total time minus backend time, includes routing, header processing, streaming) by subdomain and backend",
+		Buckets: []float64{0.0001, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1}, // 0.1ms to 100ms
 	}, []string{"subdomain", "backend"})
 
 	// Last successful request timestamp by subdomain and backend
@@ -101,13 +135,41 @@ var (
 		Name: "proxy_backend_failures_total",
 		Help: "Total number of backend failures that triggered retries by subdomain and backend",
 	}, []string{"subdomain", "backend"})
+
+	// Rate limiting metrics
+	proxyRateLimitRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "proxy_ratelimit_requests_total",
+		Help: "Total number of rate limit checks by subdomain and action",
+	}, []string{"subdomain", "action"}) // action: "allowed" or "blocked"
+
+	proxyRateLimitRemaining = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "proxy_ratelimit_remaining",
+		Help: "Remaining requests in rate limit window by subdomain",
+	}, []string{"subdomain"})
+
+	proxyRateLimitRedisErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "proxy_ratelimit_redis_errors_total",
+		Help: "Total number of Redis errors during rate limiting",
+	})
+
+	proxyRateLimitCheckDuration = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "proxy_ratelimit_check_duration_seconds",
+		Help:    "Duration of rate limit checks (Redis latency)",
+		Buckets: []float64{0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1}, // 1ms to 100ms
+	})
 )
+
+type RateLimitConfig struct {
+	Requests int           // Number of requests allowed
+	Window   time.Duration // Time window for rate limit
+}
 
 type ProxyRule struct {
 	ProxyTo      string
 	StripPath    bool
 	StripQuery   bool
 	ExtraHeaders map[string]string
+	RateLimit    *RateLimitConfig // Optional per-subdomain rate limit
 }
 
 type ProxyService struct {
@@ -118,6 +180,76 @@ type ProxyService struct {
 	transport          *http.Transport
 	proxies            sync.Map // map[string]*httputil.ReverseProxy - cached per backend
 	roundRobinCounters sync.Map // map[string]*atomic.Uint64 - round-robin counter per subdomain
+	rateLimiter        *RateLimiter
+	rateLimitEnabled   bool
+	defaultRateLimit   *RateLimitConfig
+	trustProxy         bool
+}
+
+type RateLimiter struct {
+	redis *redis.Client
+}
+
+// CheckLimit checks if the request is within rate limit using sliding window algorithm
+// Returns: allowed (bool), remaining (int), resetAt (time.Time), error
+func (rl *RateLimiter) CheckLimit(ctx context.Context, ip, subdomain string, limit int, window time.Duration) (bool, int, time.Time, error) {
+	if rl == nil || rl.redis == nil {
+		// Rate limiting disabled or Redis not available - allow request
+		return true, limit, time.Now().Add(window), nil
+	}
+
+	// Track Redis latency
+	checkStart := time.Now()
+	defer func() {
+		proxyRateLimitCheckDuration.Observe(time.Since(checkStart).Seconds())
+	}()
+
+	now := time.Now()
+	key := fmt.Sprintf("ratelimit:%s:%s", subdomain, ip)
+	windowStart := now.Add(-window)
+
+	// Use pipeline for atomic operations
+	pipe := rl.redis.Pipeline()
+
+	// 1. Add current request timestamp to sorted set
+	pipe.ZAdd(ctx, key, redis.Z{
+		Score:  float64(now.UnixNano()),
+		Member: now.UnixNano(),
+	})
+
+	// 2. Remove timestamps older than window (CRITICAL for accuracy!)
+	// TTL only removes the entire key when idle - doesn't clean old entries within the sorted set
+	// Without this: sorted set accumulates old timestamps → inaccurate counts → wrong rate limit enforcement
+	pipe.ZRemRangeByScore(ctx, key, "0", fmt.Sprintf("%d", windowStart.UnixNano()))
+
+	// 3. Count requests in current window
+	zCard := pipe.ZCard(ctx, key)
+
+	// 4. Set TTL to window duration (memory cleanup for idle keys)
+	pipe.Expire(ctx, key, window)
+
+	// Execute pipeline
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		return false, 0, time.Time{}, fmt.Errorf("redis pipeline error: %w", err)
+	}
+
+	// Get count result
+	count, err := zCard.Result()
+	if err != nil {
+		return false, 0, time.Time{}, fmt.Errorf("failed to get request count: %w", err)
+	}
+
+	remaining := limit - int(count)
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	// Calculate reset time (when oldest request will age out)
+	resetAt := now.Add(window)
+	allowed := count <= int64(limit)
+
+	return allowed, remaining, resetAt, nil
 }
 
 type proxyMetadata struct {
@@ -133,9 +265,128 @@ type proxyMetadata struct {
 	originalQuery string
 }
 
-func NewProxyService(csvPath string) *ProxyService {
+// extractClientIP extracts the real client IP from request headers
+// Priority: Forwarded (RFC 7239) > CF-Connecting-IP > True-Client-IP > X-Forwarded-For > X-Real-IP > RemoteAddr
+func extractClientIP(r *http.Request, trustProxy bool) string {
+	if !trustProxy {
+		// In development or when not behind a proxy, use RemoteAddr directly
+		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if ip == "" {
+			return r.RemoteAddr
+		}
+		return ip
+	}
+
+	// 1. Check RFC 7239 Forwarded header (standard)
+	if forwarded := r.Header.Get("Forwarded"); forwarded != "" {
+		// Parse "for=xxx" from Forwarded header
+		// Example: "for=192.0.2.60;host=example.com;proto=https"
+		forRegex := regexp.MustCompile(`for=([^;,\s]+)`)
+		if matches := forRegex.FindStringSubmatch(forwarded); len(matches) > 1 {
+			ip := strings.Trim(matches[1], "\"[]")
+			if validIP := net.ParseIP(ip); validIP != nil {
+				return ip
+			}
+		}
+	}
+
+	// 2. Check Cloudflare headers (no X- prefix, modern standard)
+	if cfIP := r.Header.Get("CF-Connecting-IP"); cfIP != "" {
+		if validIP := net.ParseIP(cfIP); validIP != nil {
+			return cfIP
+		}
+	}
+
+	if trueClientIP := r.Header.Get("True-Client-IP"); trueClientIP != "" {
+		if validIP := net.ParseIP(trueClientIP); validIP != nil {
+			return trueClientIP
+		}
+	}
+
+	// 3. Check X-Forwarded-For (legacy but widely used)
+	// Format: "client, proxy1, proxy2"
+	// Take the rightmost IP that's not a known proxy (or just the first IP for simplicity)
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		ips := strings.Split(xff, ",")
+		// Take the first IP (original client) after trimming
+		if len(ips) > 0 {
+			ip := strings.TrimSpace(ips[0])
+			if validIP := net.ParseIP(ip); validIP != nil {
+				return ip
+			}
+		}
+	}
+
+	// 4. Check X-Real-IP (legacy)
+	if xRealIP := r.Header.Get("X-Real-IP"); xRealIP != "" {
+		if validIP := net.ParseIP(xRealIP); validIP != nil {
+			return xRealIP
+		}
+	}
+
+	// 5. Fallback to RemoteAddr
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if ip == "" {
+		return r.RemoteAddr
+	}
+	return ip
+}
+
+// parseRateLimit parses rate limit string format "requests/duration" (e.g., "100/1m", "1000/1h")
+func parseRateLimit(rateLimitStr string) (*RateLimitConfig, error) {
+	parts := strings.Split(rateLimitStr, "/")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid rate limit format, expected 'requests/duration' (e.g., '100/1m')")
+	}
+
+	requests, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return nil, fmt.Errorf("invalid requests count: %w", err)
+	}
+
+	durationStr := strings.TrimSpace(parts[1])
+	var duration time.Duration
+
+	// Parse duration with support for s, m, h
+	if strings.HasSuffix(durationStr, "s") {
+		seconds, err := strconv.Atoi(strings.TrimSuffix(durationStr, "s"))
+		if err != nil {
+			return nil, fmt.Errorf("invalid duration: %w", err)
+		}
+		duration = time.Duration(seconds) * time.Second
+	} else if strings.HasSuffix(durationStr, "m") {
+		minutes, err := strconv.Atoi(strings.TrimSuffix(durationStr, "m"))
+		if err != nil {
+			return nil, fmt.Errorf("invalid duration: %w", err)
+		}
+		duration = time.Duration(minutes) * time.Minute
+	} else if strings.HasSuffix(durationStr, "h") {
+		hours, err := strconv.Atoi(strings.TrimSuffix(durationStr, "h"))
+		if err != nil {
+			return nil, fmt.Errorf("invalid duration: %w", err)
+		}
+		duration = time.Duration(hours) * time.Hour
+	} else {
+		return nil, fmt.Errorf("invalid duration format, use s/m/h suffix (e.g., '60s', '1m', '1h')")
+	}
+
+	if requests <= 0 || duration <= 0 {
+		return nil, fmt.Errorf("requests and duration must be positive")
+	}
+
+	return &RateLimitConfig{
+		Requests: requests,
+		Window:   duration,
+	}, nil
+}
+
+func NewProxyService(csvPath string, rateLimiter *RateLimiter, rateLimitEnabled bool, defaultRateLimit *RateLimitConfig, trustProxy bool) *ProxyService {
 	s := &ProxyService{
-		csvPath: csvPath,
+		csvPath:          csvPath,
+		rateLimiter:      rateLimiter,
+		rateLimitEnabled: rateLimitEnabled,
+		defaultRateLimit: defaultRateLimit,
+		trustProxy:       trustProxy,
 		// Very generous transport settings - we don't control what backends expect
 		transport: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
@@ -175,7 +426,7 @@ func (s *ProxyService) LoadRules() error {
 
 	reader := csv.NewReader(bufio.NewReader(file))
 	reader.TrimLeadingSpace = true
-	reader.FieldsPerRecord = -1 // Accept variable number of fields (4 or 5)
+	reader.FieldsPerRecord = -1 // Accept variable number of fields (4, 5, or 6)
 	reader.LazyQuotes = true    // Allow lazy quote handling for JSON strings
 
 	newRules := make(map[string][]ProxyRule)
@@ -198,9 +449,9 @@ func (s *ProxyService) LoadRules() error {
 			continue
 		}
 
-		// Validate field count (4 or 5 columns)
-		if len(record) < 4 || len(record) > 5 {
-			log.Printf("WARN: Invalid field count at line %d (expected 4 or 5, got %d), skipping", lineNum, len(record))
+		// Validate field count (4, 5, or 6 columns)
+		if len(record) < 4 || len(record) > 6 {
+			log.Printf("WARN: Invalid field count at line %d (expected 4-6, got %d), skipping", lineNum, len(record))
 			continue
 		}
 
@@ -233,12 +484,27 @@ func (s *ProxyService) LoadRules() error {
 
 		// Parse extra_headers JSON (5th column, optional)
 		var extraHeaders map[string]string
-		if len(record) == 5 {
+		if len(record) >= 5 {
 			extraHeadersStr := strings.TrimSpace(record[4])
 			if extraHeadersStr != "" {
 				if err := json.Unmarshal([]byte(extraHeadersStr), &extraHeaders); err != nil {
 					log.Printf("WARN: Invalid extra_headers JSON for subdomain '%s' at line %d: %v, skipping extra headers", subdomain, lineNum, err)
 					extraHeaders = nil
+				}
+			}
+		}
+
+		// Parse rate_limit (6th column, optional)
+		var rateLimit *RateLimitConfig
+		if len(record) == 6 {
+			rateLimitStr := strings.TrimSpace(record[5])
+			if rateLimitStr != "" {
+				parsedLimit, err := parseRateLimit(rateLimitStr)
+				if err != nil {
+					log.Printf("WARN: Invalid rate_limit '%s' for subdomain '%s' at line %d: %v, using default", rateLimitStr, subdomain, lineNum, err)
+					rateLimit = nil
+				} else {
+					rateLimit = parsedLimit
 				}
 			}
 		}
@@ -249,6 +515,7 @@ func (s *ProxyService) LoadRules() error {
 			StripPath:    stripPath,
 			StripQuery:   stripQuery,
 			ExtraHeaders: extraHeaders,
+			RateLimit:    rateLimit,
 		})
 	}
 
@@ -320,16 +587,64 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get client IP
-	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-	if clientIP == "" {
-		clientIP = r.RemoteAddr
+	// Get client IP using proper extraction (handles HAProxy/Cloudflare headers)
+	clientIP := extractClientIP(r, s.trustProxy)
+
+	// Check rate limit if enabled
+	if s.rateLimitEnabled && s.rateLimiter != nil {
+		// Determine rate limit config (per-subdomain override or global default)
+		var rateLimitConfig *RateLimitConfig
+		if len(backends) > 0 && backends[0].RateLimit != nil {
+			rateLimitConfig = backends[0].RateLimit
+		} else if s.defaultRateLimit != nil {
+			rateLimitConfig = s.defaultRateLimit
+		}
+
+		if rateLimitConfig != nil {
+			allowed, remaining, resetAt, err := s.rateLimiter.CheckLimit(
+				r.Context(),
+				clientIP,
+				subdomain,
+				rateLimitConfig.Requests,
+				rateLimitConfig.Window,
+			)
+
+			// Add rate limit headers to response
+			w.Header().Set("X-RateLimit-Limit", strconv.Itoa(rateLimitConfig.Requests))
+			w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
+			w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(resetAt.Unix(), 10))
+
+			if err != nil {
+				// Redis error - log and fail open (allow request)
+				log.Printf("ERROR: Rate limit check failed for IP %s, subdomain %s: %v (failing open)", clientIP, subdomain, err)
+				proxyRateLimitRedisErrorsTotal.Inc()
+			} else if !allowed {
+				// Rate limit exceeded - return 429
+				proxyRateLimitRequestsTotal.WithLabelValues(subdomain, "blocked").Inc()
+				proxyRateLimitRemaining.WithLabelValues(subdomain).Set(float64(remaining))
+
+				retryAfter := int(time.Until(resetAt).Seconds())
+				if retryAfter < 0 {
+					retryAfter = 0
+				}
+				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+
+				http.Error(w, "Too Many Requests: Rate limit exceeded", http.StatusTooManyRequests)
+				return
+			}
+
+			// Rate limit check passed
+			proxyRateLimitRequestsTotal.WithLabelValues(subdomain, "allowed").Inc()
+			proxyRateLimitRemaining.WithLabelValues(subdomain).Set(float64(remaining))
+		}
 	}
 
 	// Check retry policy from header (default: retry-all)
-	retryPolicy := strings.ToLower(strings.TrimSpace(r.Header.Get("Retry-Policy")))
+	retryPolicy := r.Header.Get("Retry-Policy")
 	if retryPolicy == "" {
 		retryPolicy = "retry-all"
+	} else {
+		retryPolicy = strings.ToLower(strings.TrimSpace(retryPolicy))
 	}
 
 	// Round-robin: get or create counter for this subdomain
@@ -432,7 +747,9 @@ func (s *ProxyService) tryBackend(w http.ResponseWriter, r *http.Request, subdom
 				w.Header()[k] = v
 			}
 			w.WriteHeader(rec.Code)
-			w.Write(rec.Body.Bytes())
+			if _, err := w.Write(rec.Body.Bytes()); err != nil {
+				log.Printf("WARN: Failed to write response body: %v", err)
+			}
 			return true, rec.Code, true
 		}
 
@@ -444,7 +761,9 @@ func (s *ProxyService) tryBackend(w http.ResponseWriter, r *http.Request, subdom
 				w.Header()[k] = v
 			}
 			w.WriteHeader(rec.Code)
-			w.Write(rec.Body.Bytes())
+			if _, err := w.Write(rec.Body.Bytes()); err != nil {
+				log.Printf("WARN: Failed to write response body: %v", err)
+			}
 			log.Printf("INFO: Backend %s returned non-retryable status %d for subdomain '%s', not retrying", backend, rec.Code, subdomain)
 			return false, rec.Code, true
 		}
@@ -464,7 +783,9 @@ func (s *ProxyService) tryBackend(w http.ResponseWriter, r *http.Request, subdom
 		w.Header()[k] = v
 	}
 	w.WriteHeader(rec.Code)
-	w.Write(rec.Body.Bytes())
+	if _, err := w.Write(rec.Body.Bytes()); err != nil {
+		log.Printf("WARN: Failed to write response body: %v", err)
+	}
 
 	// Return success only if 2xx
 	success := rec.Code >= 200 && rec.Code < 300
@@ -480,6 +801,10 @@ func (s *ProxyService) createReverseProxy() *httputil.ReverseProxy {
 			if !ok {
 				return
 			}
+
+			// Record backend start time (after Taiji routing/header processing, before sending to backend)
+			ctx := context.WithValue(req.Context(), backendStartTimeField, time.Now())
+			*req = *req.WithContext(ctx)
 
 			// Set backend URL
 			req.URL.Scheme = meta.targetURL.Scheme
@@ -547,10 +872,30 @@ func (s *ProxyService) createReverseProxy() *httputil.ReverseProxy {
 		ModifyResponse: func(resp *http.Response) error {
 			// Get metadata from context and update metrics
 			if meta, ok := resp.Request.Context().Value(proxyMetadataField).(proxyMetadata); ok {
+				now := time.Now()
+				totalDuration := now.Sub(meta.startTime).Seconds()
+
+				// Calculate backend duration (from Director start to ModifyResponse)
+				backendDuration := 0.0
+				if backendStartVal := resp.Request.Context().Value(backendStartTimeField); backendStartVal != nil {
+					if backendStart, ok := backendStartVal.(time.Time); ok {
+						backendDuration = now.Sub(backendStart).Seconds()
+					}
+				}
+
+				// Calculate proxy overhead (total - backend)
+				proxyOverhead := totalDuration - backendDuration
+				if proxyOverhead < 0 {
+					proxyOverhead = 0 // Safety check for clock skew
+				}
+
+				// Record metrics
 				statusCode := resp.StatusCode
-				proxyRequestsTotal.WithLabelValues(meta.subdomain, meta.backend, strconv.Itoa(statusCode)).Inc()
-				proxyRequestDuration.WithLabelValues(meta.subdomain, meta.backend).Observe(time.Since(meta.startTime).Seconds())
-				proxyLastRequestTimestamp.WithLabelValues(meta.subdomain, meta.backend).Set(float64(time.Now().Unix()))
+				proxyRequestsTotal.WithLabelValues(meta.subdomain, meta.backend, statusCodeToString(statusCode)).Inc()
+				proxyRequestDuration.WithLabelValues(meta.subdomain, meta.backend).Observe(totalDuration)
+				proxyBackendDuration.WithLabelValues(meta.subdomain, meta.backend).Observe(backendDuration)
+				proxyOverheadDuration.WithLabelValues(meta.subdomain, meta.backend).Observe(proxyOverhead)
+				proxyLastRequestTimestamp.WithLabelValues(meta.subdomain, meta.backend).Set(float64(now.Unix()))
 			}
 			return nil
 		},
@@ -558,7 +903,7 @@ func (s *ProxyService) createReverseProxy() *httputil.ReverseProxy {
 			// Get metadata from context
 			if meta, ok := req.Context().Value(proxyMetadataField).(proxyMetadata); ok {
 				log.Printf("ERROR: Backend request failed for subdomain '%s' backend '%s': %v", meta.subdomain, meta.backend, err)
-				proxyRequestsTotal.WithLabelValues(meta.subdomain, meta.backend, "502").Inc()
+				proxyRequestsTotal.WithLabelValues(meta.subdomain, meta.backend, statusCodeStrings[502]).Inc()
 			}
 			http.Error(w, "Bad Gateway: Backend request failed", http.StatusBadGateway)
 		},
@@ -771,8 +1116,90 @@ func main() {
 		port = defaultPort
 	}
 
+	// Rate limiting configuration
+	rateLimitEnabled := true
+	if rateLimitEnv := os.Getenv("RATE_LIMIT_ENABLED"); rateLimitEnv != "" {
+		var err error
+		rateLimitEnabled, err = strconv.ParseBool(rateLimitEnv)
+		if err != nil {
+			log.Printf("WARN: Invalid RATE_LIMIT_ENABLED value '%s', defaulting to true", rateLimitEnv)
+			rateLimitEnabled = true
+		}
+	}
+
+	trustProxy := true
+	if trustProxyEnv := os.Getenv("RATE_LIMIT_TRUST_PROXY"); trustProxyEnv != "" {
+		var err error
+		trustProxy, err = strconv.ParseBool(trustProxyEnv)
+		if err != nil {
+			log.Printf("WARN: Invalid RATE_LIMIT_TRUST_PROXY value '%s', defaulting to true", trustProxyEnv)
+			trustProxy = true
+		}
+	}
+
+	// Parse default rate limit
+	var defaultRateLimit *RateLimitConfig
+	defaultRateLimitStr := os.Getenv("RATE_LIMIT_DEFAULT")
+	if defaultRateLimitStr == "" {
+		defaultRateLimitStr = "100/1m"
+	}
+	parsedDefault, err := parseRateLimit(defaultRateLimitStr)
+	if err != nil {
+		log.Printf("WARN: Invalid RATE_LIMIT_DEFAULT '%s': %v, using 100/1m", defaultRateLimitStr, err)
+		defaultRateLimit = &RateLimitConfig{Requests: 100, Window: time.Minute}
+	} else {
+		defaultRateLimit = parsedDefault
+	}
+
+	// Initialize Redis client for rate limiting
+	var rateLimiter *RateLimiter
+	if rateLimitEnabled {
+		redisAddr := os.Getenv("REDIS_ADDR")
+		if redisAddr == "" {
+			redisAddr = "localhost:6379"
+		}
+		redisPassword := os.Getenv("REDIS_PASSWORD")
+		redisDB := 0
+		if redisDBStr := os.Getenv("REDIS_DB"); redisDBStr != "" {
+			parsedDB, err := strconv.Atoi(redisDBStr)
+			if err != nil {
+				log.Printf("WARN: Invalid REDIS_DB value '%s', using 0", redisDBStr)
+			} else {
+				redisDB = parsedDB
+			}
+		}
+
+		redisClient := redis.NewClient(&redis.Options{
+			Addr:         redisAddr,
+			Password:     redisPassword,
+			DB:           redisDB,
+			DialTimeout:  5 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+			PoolSize:     100,
+			MinIdleConns: 10,
+		})
+
+		// Test Redis connection
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := redisClient.Ping(ctx).Err(); err != nil {
+			log.Printf("WARN: Failed to connect to Redis at %s: %v (rate limiting will be disabled)", redisAddr, err)
+			rateLimitEnabled = false
+		} else {
+			log.Printf("INFO: Connected to Redis at %s for rate limiting", redisAddr)
+			rateLimiter = &RateLimiter{redis: redisClient}
+		}
+	}
+
+	if rateLimitEnabled && rateLimiter != nil {
+		log.Printf("INFO: Rate limiting enabled: %d requests per %s (default)", defaultRateLimit.Requests, defaultRateLimit.Window)
+	} else {
+		log.Println("INFO: Rate limiting disabled")
+	}
+
 	// Initialize service
-	service := NewProxyService(csvPath)
+	service := NewProxyService(csvPath, rateLimiter, rateLimitEnabled, defaultRateLimit, trustProxy)
 
 	// Initial load
 	if err := service.LoadRules(); err != nil {

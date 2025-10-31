@@ -1,255 +1,170 @@
 # Taiji (太极)
 
-High-performance HTTP reverse proxy service for wildcard subdomain routing with per-rule configuration.
+High-performance HTTP reverse proxy with wildcard subdomain routing, distributed rate limiting, and zero-copy streaming.
 
 *Like the martial art, Taiji smoothly redirects incoming requests with effortless flow and zero resistance.*
 
-## Overview
+## What is Taiji?
 
-This service acts as a reverse proxy from `*.test-api.pocket.network` (or `*.api.pocket.network` in production) to destination backends configured via a CSV file. Built with Go's standard library `net/http` and `httputil.ReverseProxy` for proper streaming support, maximum reliability, and minimal latency.
+Taiji is a production-ready reverse proxy that routes requests from wildcard subdomains (e.g., `*.api.pocket.network`) to backend services based on CSV configuration. Built on Go's `net/http` and `httputil.ReverseProxy`, it handles high-throughput traffic with minimal latency.
 
-### Features
+### Core Capabilities
 
-- **True Streaming**: Zero-copy streaming with `httputil.ReverseProxy` - request/response bodies are NEVER buffered
-- **Minimal Latency**: ~1-2ms added latency for typical requests
-- **Supports All Traffic**:
-  - Large file uploads/downloads (no size limits)
-  - Server-Sent Events (SSE)
-  - WebSocket upgrades
-  - Chunked transfer encoding
-  - Long-running requests
-  - Video/audio streaming
-- **Full Request Forwarding**: Forwards all headers, body, path, query parameters, and client IP
-- **Per-Rule Configuration**: Each subdomain can have a unique proxy behavior
-- **Multiple Backends**: Round-robin load balancing with optional retry-all policy
-- **Hot Reload**: Automatically reloads CSV configuration without restart
-- **Production Ready**: Battle-tested Go standard library, no body size limits, generous timeouts
-- **Observable**: Prometheus metrics, structured logging
-- **Deployment Flexible**: Deploy anywhere - bare metal, containers, VMs, or orchestrators
-- **Connection Pooling**: Optimized HTTP client with connection reuse for backend requests
+- **Zero-Copy Streaming** - True streaming with no buffering. Supports uploads/downloads of any size, SSE, WebSockets, chunked encoding, and long-running connections
+- **Distributed Rate Limiting** - Redis-backed sliding window algorithm with per-IP tracking across all instances
+- **Load Balancing** - Round-robin across multiple backends with configurable retry policies
+- **Hot Reloading** - CSV configuration updates apply automatically without restart
+- **Production-Grade** - ~1-2ms added latency, unlimited timeouts for streaming, connection pooling, Prometheus metrics
 
 ### How It Works
 
 ```
-Request: https://eth.test-api.pocket.network/v1/relay?chain=1
+Request: https://eth.api.pocket.network/v1/relay?chain=1
          ↓
-Service: Extracts subdomain "eth", looks up in CSV
+Taiji: Extracts subdomain "eth", looks up backend in CSV
          ↓
-CSV Rule: eth,backend.example.com/api
+CSV: eth,https://backend.example.com/api,false,false
          ↓
-Proxy:   Forwards request → https://backend.example.com/api/v1/relay?chain=1
+Backend: https://backend.example.com/api/v1/relay?chain=1
          ↓
-Response: Returns backend response to client
+Response: Streams backend response to client
 ```
-
-## CSV Configuration Format
-
-```csv
-subdomain,proxy_to,strip_path,strip_query,extra_headers
-eth,https://backend.example.com/api,false,false,""
-```
-
-### Fields
-
-- **subdomain**: Subdomain to match (without domain suffix)
-- **proxy_to**: Backend destination host/path (must include scheme: http:// or https://)
-- **strip_path**: Remove an incoming path before forwarding? (true/false)
-- **strip_query**: Remove incoming query string before forwarding? (true/false)
-- **extra_headers**: Optional JSON object with custom headers to add for this backend (e.g., `{"Authorization": "Bearer token"}`)
-
-### Multiple Backends (Load Balancing)
-
-You can configure multiple backends for the same subdomain by adding multiple rows with the same subdomain name. Requests will be distributed across backends using **round-robin** load balancing:
-
-```csv
-subdomain,proxy_to,strip_path,strip_query,extra_headers
-eth,https://backend1.example.com,false,false,""
-eth,https://backend2.example.com,false,false,"{""Authorization"": ""Bearer token123""}"
-eth,https://backend3.example.com,false,false,""
-```
-
-**Note**: When using JSON in the extra_headers field, internal quotes must be escaped by doubling them (`""`) for proper CSV parsing.
-
-### Examples
-
-| Configuration                                              | Incoming Request                                | Proxied Request                                |
-|------------------------------------------------------------|-------------------------------------------------|------------------------------------------------|
-| `eth,https://backend.example.com/v1/abc,true,true,""`      | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc`           |
-| `eth,https://backend.example.com/v1/abc,false,true,""`     | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc/foo`       |
-| `eth,https://backend.example.com/v1/abc,false,false,""`    | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc/foo?bar=1` |
-| `eth,https://backend.example.com/v1/abc,true,false,""`     | `https://eth.test-api.pocket.network/foo?bar=1` | `https://backend.example.com/v1/abc?bar=1`     |
-
-### Header Forwarding
-
-The proxy automatically adds the following headers to backend requests:
-
-#### Legacy Headers (X-Forwarded-*)
-- **X-Forwarded-For**: Client IP address (appended to existing value if present)
-- **X-Real-IP**: Original client IP address
-- **X-Forwarded-Proto**: Original request protocol (http/https)
-- **X-Forwarded-Host**: Original Host header value
-
-#### Standard Header (RFC 7239)
-- **Forwarded**: Standardized header containing `for=<clientIP>;host=<originalHost>;proto=<scheme>`
-  - Example: `Forwarded: for=192.0.2.60;host=api.example.com;proto=https`
-  - Properly appended when multiple proxies are chained
-
-#### All Original Headers
-- All incoming headers are forwarded to the backend (except hop-by-hop headers like Connection, Keep-Alive, Transfer-Encoding, etc.)
-
-### Retry Policy
-
-When multiple backends are configured for a subdomain, you can control the retry behavior using the `Retry-Policy` header in your request:
-
-- **`Retry-Policy: fail-fast`** (default): Uses round-robin to select one backend. If it fails, return the error immediately.
-- **`Retry-Policy: retry-all`**: Tries all backends in round-robin order until one succeeds (2xx status) or all are exhausted.
-
-Example:
-```bash
-# Try all backends until success
-curl -H "Host: eth.test-api.pocket.network" \
-     -H "Retry-Policy: retry-all" \
-     http://localhost:8080/v1/relay
-
-# Use single backend (default)
-curl -H "Host: eth.test-api.pocket.network" \
-     http://localhost:8080/v1/relay
-```
-
-## Streaming Architecture
-
-This proxy is built on Go's `httputil.ReverseProxy` which provides **true zero-copy streaming**:
-
-- **Request bodies** are streamed directly from a client → backend (never read into memory)
-- **Response bodies** are streamed directly from the backend → client (never buffered)
-- **No size limits** on request or response bodies
-- **Chunked transfer encoding** is preserved and forwarded correctly
-- **WebSocket upgrades** are supported via the `Upgrade` header
-- **Long-running connections** (SSE, streaming APIs) work perfectly
-
-### Timeout Configuration
-
-Very generous timeout settings since we don't control what backends or clients expect:
-
-- **ReadTimeout**: `0` (unlimited) - supports long-running uploads
-- **WriteTimeout**: `0` (unlimited) - supports long-running responses
-- **ReadHeaderTimeout**: `30s` - prevents Slowloris attacks while allowing streaming
-- **IdleTimeout**: `120s` - keep-alive connections
-- **Backend ResponseHeaderTimeout**: `0` (unlimited) - supports slow backends
-- **No connection limits** - maxed out for production workloads
 
 ## Quick Start
 
-### Prerequisites
-
-- Go 1.23+ (for building from source)
-- Docker (optional, for containerized deployment)
-
-### Local Development
-
 ```bash
-# The service uses examples/proxies.csv by default
-# Just run it directly:
-make run
+# Start backend services (httpbin + redis)
+docker compose up -d
 
-# Or with go run:
+# Run Taiji
 go run main.go
 
-# Optional: Run local httpbin for faster/more reliable testing
-# In a separate terminal:
-docker run -p 4040:80 kennethreitz/httpbin
-# Then update examples/proxies.csv to use localhost:4040 instead of httpbin.org
-
-# Test basic proxy (strips path/query)
-curl -v http://localhost:8080/anything -H "Host: httpbin_strip.test-api.pocket.network"
-
-# Test with path preservation
-curl -v http://localhost:8080/v1/test -H "Host: httpbin_path.test-api.pocket.network"
-
-# Test full preservation with httpbin endpoints:
-curl -v http://localhost:8080/get -H "Host: httpbin.test-api.pocket.network"
-curl -v http://localhost:8080/post -H "Host: httpbin.test-api.pocket.network" -X POST -d '{"test":true}'
-
-# Test streaming (see data arrive in real-time):
-curl --no-buffer http://localhost:8080/stream/10 -H "Host: httpbin.test-api.pocket.network"
-time curl --no-buffer "http://localhost:8080/drip?duration=3&numbytes=500" -H "Host: httpbin.test-api.pocket.network"
+# Test it
+curl http://localhost:8080/get -H "Host: httpbin.test-api.pocket.network"
 ```
-
-### Building
-
-```bash
-# Build binary locally
-make build
-# Output: bin/taiji
-
-# Build Docker image
-make docker-build
-
-# Run Docker container locally
-make docker-run
-
-# Push Docker image to registry
-make docker-push
-```
-
-### Deployment Options
-
-Taiji can be deployed in many ways:
-
-**Binary Deployment:**
-```bash
-# Build and run directly
-./bin/taiji
-
-# With custom configuration
-CSV_PATH=/path/to/proxies.csv PORT=8080 ./bin/taiji
-```
-
-**Docker Deployment:**
-```bash
-docker run -d \
-  -p 8080:8080 \
-  -v $(pwd)/proxies.csv:/config/proxies.csv:ro \
-  -e CSV_PATH=/config/proxies.csv \
-  ghcr.io/pokt-network/taiji:latest
-```
-
-**Systemd Service:**
-```bash
-# Create /etc/systemd/system/taiji.service
-[Unit]
-Description=Taiji Reverse Proxy
-After=network.target
-
-[Service]
-Type=simple
-User=taiji
-Environment="CSV_PATH=/etc/taiji/proxies.csv"
-Environment="PORT=8080"
-ExecStart=/usr/local/bin/taiji
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-**Container Orchestrators:**
-- Kubernetes, Docker Compose, Docker Swarm, Nomad, etc. - standard container deployment
 
 ## Configuration
 
+### CSV Format
+
+```csv
+subdomain,proxy_to,strip_path,strip_query,extra_headers,rate_limit
+eth,https://backend.example.com/api,false,false,"",100/1m
+```
+
+**Fields:**
+- `subdomain` - Subdomain to match (e.g., "eth" matches eth.api.pocket.network)
+- `proxy_to` - Backend URL with optional path (must include http:// or https://)
+- `strip_path` - Remove incoming path before forwarding (true/false)
+- `strip_query` - Remove incoming query string before forwarding (true/false)
+- `extra_headers` - JSON object with custom headers (e.g., `{"Authorization": "Bearer token"}`)
+- `rate_limit` - Per-subdomain limit (e.g., `100/1m`, `1000/1h`) or empty for default
+
+**Path/Query Examples:**
+
+| strip_path | strip_query | Request: `/foo?bar=1` | Forwarded to backend |
+|------------|-------------|----------------------|----------------------|
+| `true`     | `true`      | `/foo?bar=1`         | `/`                  |
+| `false`    | `true`      | `/foo?bar=1`         | `/foo`               |
+| `false`    | `false`     | `/foo?bar=1`         | `/foo?bar=1`         |
+| `true`     | `false`     | `/foo?bar=1`         | `/?bar=1`            |
+
+**Load Balancing:**
+Add multiple rows with the same subdomain for round-robin load balancing:
+
+```csv
+subdomain,proxy_to,strip_path,strip_query,extra_headers,rate_limit
+eth,https://backend1.example.com,false,false,"",100/1m
+eth,https://backend2.example.com,false,false,"{""Auth"": ""token""}",100/1m
+eth,https://backend3.example.com,false,false,"",100/1m
+```
+
+Control retry behavior with `Retry-Policy` header:
+- `Retry-Policy: fail-fast` (default) - Try one backend, fail immediately if it errors
+- `Retry-Policy: retry-all` - Try all backends until one succeeds
+
 ### Environment Variables
 
-| Variable   | Default                | Description                    |
-|------------|------------------------|--------------------------------|
-| `CSV_PATH` | `examples/proxies.csv` | Path to CSV configuration file |
-| `PORT`     | `8080`                 | HTTP server port               |
+| Variable                  | Default                | Description                                          |
+|---------------------------|------------------------|------------------------------------------------------|
+| `CSV_PATH`                | `examples/proxies.csv` | Path to CSV configuration file                       |
+| `PORT`                    | `8080`                 | HTTP server port                                     |
+| `RATE_LIMIT_ENABLED`      | `true`                 | Enable/disable rate limiting                         |
+| `RATE_LIMIT_DEFAULT`      | `100/1m`               | Default rate limit (requests/duration)               |
+| `RATE_LIMIT_TRUST_PROXY`  | `true`                 | Trust proxy headers for IP extraction                |
+| `REDIS_ADDR`              | `localhost:6379`       | Redis server address for rate limiting               |
+| `REDIS_PASSWORD`          | (empty)                | Redis password (optional)                            |
+| `REDIS_DB`                | `0`                    | Redis database number                                |
 
-### Updating Proxy Rules
+CSV changes are detected automatically and reload within ~1 second (no restart needed).
 
-Edit the CSV file specified in `CSV_PATH` and the service automatically detects changes and reloads within ~1 second. No restart required!
+### Rate Limiting
 
-## Endpoints
+Distributed IP-based rate limiting using Redis with sliding window algorithm:
+
+**How it works:**
+- Per-IP tracking across all Taiji instances via shared Redis state
+- Sliding window algorithm prevents boundary exploits
+- Extracts real client IP from `Forwarded`, `CF-Connecting-IP`, `X-Forwarded-For`, etc.
+- Returns standard `X-RateLimit-*` headers and `Retry-After` on 429s
+- Fails open if Redis unavailable (allows requests)
+
+**Rate limit format:** `{requests}/{duration}` - e.g., `100/1m`, `1000/1h`, `10/30s`
+
+**Example response headers:**
+```
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 47
+X-RateLimit-Reset: 1704067200
+```
+
+**Test distributed rate limiting:**
+```bash
+make test-distributed  # 2 Taiji instances + HAProxy + Redis
+```
+
+### Headers & Forwarding
+
+Taiji forwards all client headers to backends plus:
+- `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto`, `X-Forwarded-Host` (legacy)
+- `Forwarded: for=<clientIP>;host=<host>;proto=<scheme>` (RFC 7239)
+
+## Deployment
+
+**Docker:**
+```bash
+docker run -d -p 8080:8080 \
+  -v $(pwd)/proxies.csv:/config/proxies.csv:ro \
+  -e REDIS_ADDR=redis:6379 \
+  ghcr.io/pokt-network/taiji:latest
+```
+
+**Kubernetes:**
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: taiji
+spec:
+  template:
+    spec:
+      containers:
+      - name: taiji
+        image: ghcr.io/pokt-network/taiji:latest
+        env:
+        - name: REDIS_ADDR
+          value: "redis:6379"
+        - name: RATE_LIMIT_DEFAULT
+          value: "100/1m"
+```
+
+**Binary:**
+```bash
+make build
+CSV_PATH=/path/to/proxies.csv ./bin/taiji
+```
+
+## API Endpoints
 
 | Endpoint       | Description                                               |
 |----------------|-----------------------------------------------------------|
@@ -260,152 +175,44 @@ Edit the CSV file specified in `CSV_PATH` and the service automatically detects 
 
 ## Monitoring
 
-Taiji includes ready-to-use Grafana dashboards and Prometheus alerts for production monitoring.
+**Pre-configured resources:** `monitoring/grafana/taiji-dashboard.yaml` and `monitoring/prometheus/taiji-alerts.yaml`
 
-### Kubernetes/OpenShift Deployment
+**Key Prometheus metrics:**
+```
+proxy_requests_total{subdomain,backend,status_code}  # Request counts
+proxy_request_duration_seconds{subdomain,backend}    # Latency histogram
+proxy_ratelimit_requests_total{subdomain,action}     # Rate limit allowed/blocked
+proxy_ratelimit_check_duration_seconds               # Redis latency
+proxy_rules_total                                    # Loaded backends
+```
 
-Pre-configured monitoring resources are available in the `monitoring/` directory:
-
-- **`monitoring/grafana/taiji-dashboard.yaml`** - Grafana dashboard ConfigMap with:
-  - Backend filtering support
-  - Multi-backend traffic visualization
-  - Per-backend error rates and latency
-  - Load distribution analysis
-  - Round-robin health monitoring
-
-- **`monitoring/prometheus/taiji-alerts.yaml`** - PrometheusRule with alerts for:
-  - High error rates (by subdomain and backend)
-  - Backend health issues (502 errors, latency)
-  - Service availability
-  - Configuration reload failures
-  - Uneven load distribution
-  - Performance degradation
-
-**To deploy:**
+**Deploy monitoring:**
 ```bash
 kubectl apply -f monitoring/grafana/taiji-dashboard.yaml
 kubectl apply -f monitoring/prometheus/taiji-alerts.yaml
 ```
 
-### Prometheus Metrics
+## Testing & Development
 
-```
-# Number of proxy backends loaded (total across all subdomains)
-proxy_rules_total
-
-# Last successful rule load timestamp
-proxy_rules_last_load_timestamp_seconds
-
-# Total proxy requests by subdomain, backend, and status code
-proxy_requests_total{subdomain="eth",backend="backend1.example.com",status_code="200"}
-
-# Proxy request duration by subdomain and backend
-proxy_request_duration_seconds{subdomain="eth",backend="backend1.example.com"}
-
-# Last successful proxy request timestamp by subdomain and backend
-proxy_last_request_timestamp_seconds{subdomain="eth",backend="backend1.example.com"}
-
-# Active proxy rules by subdomain
-proxy_rule_active{subdomain="eth"}
-
-# CSV reload attempts and errors
-proxy_csv_reload_total
-proxy_csv_reload_errors_total
-
-# File watcher restarts
-proxy_watcher_restarts_total
-```
-
-**Note**: The `backend` label in metrics allows you to track load distribution and health of individual backends within a subdomain.
-
-### Logs
-
-Structured logs with log levels:
-
-- `INFO`: Normal operations
-- `WARN`: Non-fatal issues (invalid CSV rows)
-- `ERROR`: Errors that need attention
-- `FATAL`: Critical errors (service won't start)
-
-## Development
-
-### Project Structure
-
-```
-taiji/
-├── main.go                 # Single-file Go application
-├── go.mod                  # Go module definition
-├── go.sum                  # Dependency checksums
-├── Dockerfile              # Multi-stage Docker build
-├── Makefile                # Build automation
-├── test.sh                 # Test suite
-├── README.md               # This file
-└── examples/
-    ├── proxies.csv         # Example proxy configurations
-    └── README.md           # Testing examples
-```
-
-### Make Targets
-
-Run `make help` to see all available targets:
-
-```
-  build                 Build the Go binary locally
-  run                   Run the service locally
-  clean                 Clean build artifacts
-  docker-build          Build Docker image
-  docker-push           Push Docker image to registry
-  docker-run            Run Docker container locally
-  docker-buildx         Build multi-platform image (arm64/amd64)
-  fmt                   Format Go code
-  lint                  Run linter
-  security-scan         Scan Docker image for vulnerabilities
-```
-
-### Running Tests
-
+**Run tests:**
 ```bash
-# Run the test suite (requires service to be running)
-./test.sh
-
-# Or test against a specific endpoint
-./test.sh http://localhost:8080
+./test.sh                   # Basic test suite
+make test-distributed       # Distributed rate limiting (2 instances + HAProxy + Redis)
 ```
 
-### Load Testing
-
-The Makefile includes load testing targets using [hey](https://github.com/rakyll/hey):
-
+**Load testing:**
 ```bash
-# Basic load test with default method (eth_blockNumber)
-make load-test \
-  LOAD_TEST_URL=https://eth.api.pocket.network \
-  LOAD_TEST_REQUESTS=5000 \
-  LOAD_TEST_CONCURRENCY=100 \
-  LOAD_TEST_DURATION=60s
-
-# Load test with custom payload (for methods requiring parameters)
-make load-test \
-  LOAD_TEST_URL=https://eth.api.pocket.network \
-  LOAD_TEST_REQUESTS=5000 \
-  LOAD_TEST_CONCURRENCY=100 \
-  LOAD_TEST_DURATION=60s \
-  LOAD_TEST_PAYLOAD='{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["0x1b4",true],"id":1}'
-
-# Quick load test (100 requests, 10 concurrent, 10s)
-make load-test-quick
-
-# Stress test (10000 requests, 200 concurrent, 60s)
-make load-test-stress
+make load-test-quick        # 100 req, 10 concurrent, 10s
+make load-test-stress       # 10k req, 200 concurrent, 60s
+make load-test LOAD_TEST_URL=... LOAD_TEST_REQUESTS=... LOAD_TEST_CONCURRENCY=...
 ```
 
-**Parameters:**
-- `LOAD_TEST_URL`: Target URL (default: `https://eth.api.pocket.network`)
-- `LOAD_TEST_REQUESTS`: Number of requests (default: `1000`)
-- `LOAD_TEST_CONCURRENCY`: Concurrent workers (default: `50`)
-- `LOAD_TEST_DURATION`: Test duration (default: `30s`)
-- `LOAD_TEST_METHOD`: JSON-RPC method with empty params (default: `eth_blockNumber`)
-- `LOAD_TEST_PAYLOAD`: Full custom JSON payload (overrides `LOAD_TEST_METHOD`)
+**Build commands:**
+```bash
+make build          # Build binary (output: bin/taiji)
+make docker-build   # Build Docker image
+make run            # Run locally with examples/proxies.csv
+```
 
 ## License
 

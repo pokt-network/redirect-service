@@ -123,3 +123,35 @@ load-test-quick: ## Quick load test (100 requests, 10 concurrent)
 
 load-test-stress: ## Stress test (10000 requests, 200 concurrent)
 	@$(MAKE) load-test LOAD_TEST_REQUESTS=10000 LOAD_TEST_CONCURRENCY=200 LOAD_TEST_DURATION=60s
+
+docker-compose-up: ## Start docker-compose services (httpbin + redis)
+	@echo "$(COLOR_YELLOW)Starting docker-compose services...$(COLOR_RESET)"
+	docker-compose up -d
+	@echo "$(COLOR_GREEN)✓ Services started: httpbin1 (4040), httpbin2 (4041), redis (6379)$(COLOR_RESET)"
+
+docker-compose-down: ## Stop docker-compose services
+	@echo "$(COLOR_YELLOW)Stopping docker-compose services...$(COLOR_RESET)"
+	docker-compose down
+	@echo "$(COLOR_GREEN)✓ Services stopped$(COLOR_RESET)"
+
+docker-compose-logs: ## Show docker-compose logs
+	docker-compose logs -f
+
+test-local: docker-compose-up ## Run tests with docker-compose services
+	@echo "$(COLOR_YELLOW)Waiting for services to be ready...$(COLOR_RESET)"
+	@sleep 3
+	@echo "$(COLOR_YELLOW)Running tests...$(COLOR_RESET)"
+	./test.sh
+	@echo "$(COLOR_GREEN)✓ Tests complete$(COLOR_RESET)"
+
+test-distributed: ## Test distributed rate limiting with 2 Taiji instances + HAProxy
+	@echo "$(COLOR_YELLOW)Building and starting distributed setup...$(COLOR_RESET)"
+	docker-compose up -d --build
+	@echo "$(COLOR_YELLOW)Waiting for services to be ready...$(COLOR_RESET)"
+	@sleep 10
+	@echo "$(COLOR_YELLOW)Running distributed rate limiting test...$(COLOR_RESET)"
+	./test-distributed.sh
+	@echo "$(COLOR_GREEN)✓ Test complete$(COLOR_RESET)"
+
+logs-distributed: ## Show logs from both Taiji instances
+	docker-compose logs -f taiji-1 taiji-2

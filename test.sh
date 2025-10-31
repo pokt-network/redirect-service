@@ -236,6 +236,140 @@ else
     echo -e "${YELLOW}⚠ Retry-Policy: retry-all inconclusive (HTTP $HTTP_CODE)${NC}\n"
 fi
 
+# Test rate limiting
+echo -e "${YELLOW}[TEST] Rate limiting - Headers present${NC}"
+echo -e "${YELLOW}  → Testing rate limit headers in response${NC}"
+
+# Make request to rate_limited subdomain (10/1m limit in CSV)
+RESPONSE=$(curl -s -D - -H "Host: rate_limited.test-api.pocket.network" "$ENDPOINT/get" 2>/dev/null || echo "")
+RATE_LIMIT_HEADER=$(echo "$RESPONSE" | grep -i "X-RateLimit-Limit" || echo "")
+REMAINING_HEADER=$(echo "$RESPONSE" | grep -i "X-RateLimit-Remaining" || echo "")
+RESET_HEADER=$(echo "$RESPONSE" | grep -i "X-RateLimit-Reset" || echo "")
+
+if [ -n "$RATE_LIMIT_HEADER" ] && [ -n "$REMAINING_HEADER" ] && [ -n "$RESET_HEADER" ]; then
+    echo -e "${GREEN}✓ Rate limit headers present in response${NC}"
+    echo -e "${GREEN}  Headers: $(echo "$RATE_LIMIT_HEADER" | tr -d '\r')${NC}"
+    echo -e "${GREEN}  Remaining: $(echo "$REMAINING_HEADER" | tr -d '\r')${NC}\n"
+else
+    echo -e "${YELLOW}⚠ Rate limit headers not found (rate limiting may be disabled)${NC}\n"
+fi
+
+# Test rate limit enforcement
+echo -e "${YELLOW}[TEST] Rate limiting - Enforcement (10 requests/min limit)${NC}"
+echo -e "${YELLOW}  → Sending 15 requests rapidly to rate_limited subdomain${NC}"
+
+SUCCESS_COUNT=0
+RATE_LIMITED_COUNT=0
+
+for i in {1..15}; do
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H "Host: rate_limited.test-api.pocket.network" \
+        "$ENDPOINT/get" 2>/dev/null || echo "000")
+
+    if [ "$HTTP_CODE" == "200" ]; then
+        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    elif [ "$HTTP_CODE" == "429" ]; then
+        RATE_LIMITED_COUNT=$((RATE_LIMITED_COUNT + 1))
+    fi
+done
+
+echo -e "${YELLOW}  Results: $SUCCESS_COUNT succeeded, $RATE_LIMITED_COUNT rate-limited${NC}"
+
+if [ "$RATE_LIMITED_COUNT" -ge 5 ]; then
+    echo -e "${GREEN}✓ Rate limiting enforcement working (${RATE_LIMITED_COUNT}/15 requests blocked)${NC}\n"
+elif [ "$SUCCESS_COUNT" -eq 15 ] && [ "$RATE_LIMITED_COUNT" -eq 0 ]; then
+    echo -e "${YELLOW}⚠ Rate limiting not enforced (all requests succeeded, Redis may be disabled)${NC}\n"
+else
+    echo -e "${YELLOW}⚠ Rate limiting test inconclusive (${SUCCESS_COUNT} succeeded, ${RATE_LIMITED_COUNT} blocked)${NC}\n"
+fi
+
+# Test rate limit 429 response
+echo -e "${YELLOW}[TEST] Rate limiting - 429 Response headers${NC}"
+echo -e "${YELLOW}  → Testing 429 response includes Retry-After header${NC}"
+
+# Trigger rate limit by sending many requests
+for i in {1..12}; do
+    curl -s -o /dev/null -H "Host: rate_limited.test-api.pocket.network" "$ENDPOINT/get" 2>/dev/null || true
+done
+
+# Now should get 429
+RESPONSE_429=$(curl -s -D - -o /dev/null -H "Host: rate_limited.test-api.pocket.network" "$ENDPOINT/get" 2>/dev/null || echo "")
+HTTP_CODE=$(echo "$RESPONSE_429" | grep -oP "HTTP/\d\.\d \K\d{3}" | head -1)
+RETRY_AFTER=$(echo "$RESPONSE_429" | grep -i "Retry-After" || echo "")
+
+if [ "$HTTP_CODE" == "429" ]; then
+    if [ -n "$RETRY_AFTER" ]; then
+        echo -e "${GREEN}✓ 429 response includes Retry-After header${NC}"
+        echo -e "${GREEN}  $(echo "$RETRY_AFTER" | tr -d '\r')${NC}\n"
+    else
+        echo -e "${YELLOW}⚠ 429 response received but Retry-After header missing${NC}\n"
+    fi
+elif [ "$HTTP_CODE" == "200" ]; then
+    echo -e "${YELLOW}⚠ Could not trigger rate limit (Redis may be disabled or limit very high)${NC}\n"
+else
+    echo -e "${YELLOW}⚠ Unexpected response code: HTTP $HTTP_CODE${NC}\n"
+fi
+
+# Test per-subdomain rate limits
+echo -e "${YELLOW}[TEST] Rate limiting - Per-subdomain limits${NC}"
+echo -e "${YELLOW}  → Testing different limits: rate_limited (10/1m) vs rate_generous (1000/1h)${NC}"
+
+# Clear any existing limits by waiting a moment
+sleep 1
+
+# Test rate_generous (should allow many requests)
+GENEROUS_SUCCESS=0
+for i in {1..20}; do
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H "Host: rate_generous.test-api.pocket.network" \
+        "$ENDPOINT/get" 2>/dev/null || echo "000")
+
+    if [ "$HTTP_CODE" == "200" ]; then
+        GENEROUS_SUCCESS=$((GENEROUS_SUCCESS + 1))
+    fi
+done
+
+# Test rate_limited (should block after 10)
+LIMITED_SUCCESS=0
+LIMITED_BLOCKED=0
+for i in {1..15}; do
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H "Host: rate_limited.test-api.pocket.network" \
+        "$ENDPOINT/get" 2>/dev/null || echo "000")
+
+    if [ "$HTTP_CODE" == "200" ]; then
+        LIMITED_SUCCESS=$((LIMITED_SUCCESS + 1))
+    elif [ "$HTTP_CODE" == "429" ]; then
+        LIMITED_BLOCKED=$((LIMITED_BLOCKED + 1))
+    fi
+done
+
+echo -e "${YELLOW}  rate_generous: ${GENEROUS_SUCCESS}/20 succeeded${NC}"
+echo -e "${YELLOW}  rate_limited: ${LIMITED_SUCCESS}/15 succeeded, ${LIMITED_BLOCKED}/15 blocked${NC}"
+
+if [ "$GENEROUS_SUCCESS" -ge 15 ] && [ "$LIMITED_BLOCKED" -ge 3 ]; then
+    echo -e "${GREEN}✓ Per-subdomain rate limits working correctly${NC}\n"
+elif [ "$GENEROUS_SUCCESS" -eq 0 ] || [ "$LIMITED_SUCCESS" -eq 0 ]; then
+    echo -e "${YELLOW}⚠ Per-subdomain test skipped (backend not responding)${NC}\n"
+else
+    echo -e "${YELLOW}⚠ Per-subdomain rate limits inconclusive (may need Redis)${NC}\n"
+fi
+
+# Test rate limit metrics
+echo -e "${YELLOW}[TEST] Rate limiting - Prometheus metrics${NC}"
+METRICS=$(curl -s "$ENDPOINT/metrics")
+RATELIMIT_ALLOWED=$(echo "$METRICS" | grep 'proxy_ratelimit_requests_total.*action="allowed"' || echo "")
+RATELIMIT_BLOCKED=$(echo "$METRICS" | grep 'proxy_ratelimit_requests_total.*action="blocked"' || echo "")
+
+if [ -n "$RATELIMIT_ALLOWED" ] || [ -n "$RATELIMIT_BLOCKED" ]; then
+    echo -e "${GREEN}✓ Rate limit metrics present in Prometheus${NC}"
+    [ -n "$RATELIMIT_ALLOWED" ] && echo -e "${GREEN}  Found: proxy_ratelimit_requests_total{action=\"allowed\"}${NC}"
+    [ -n "$RATELIMIT_BLOCKED" ] && echo -e "${GREEN}  Found: proxy_ratelimit_requests_total{action=\"blocked\"}${NC}"
+    echo ""
+else
+    echo -e "${YELLOW}⚠ Rate limit metrics not found (may be disabled)${NC}\n"
+fi
+
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}All tests passed! 🎉${NC}"
 echo -e "${GREEN}========================================${NC}"

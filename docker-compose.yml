@@ -1,0 +1,112 @@
+version: '3.8'
+
+services:
+  # HAProxy - Load balancer for testing distributed rate limiting
+  haproxy:
+    image: haproxy:2.8-alpine
+    container_name: taiji-haproxy
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - taiji-1
+      - taiji-2
+    healthcheck:
+      test: ["CMD", "sh", "-c", "echo 'show info' | nc localhost 9999"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # Taiji instance 1
+  taiji-1:
+    build:
+      context: .
+      pull: true
+    container_name: taiji-1
+    ports:
+      - "8081:8080"
+    environment:
+      - PORT=8080
+      - CSV_PATH=/config/proxies.csv
+      - REDIS_ADDR=redis:6379
+      - RATE_LIMIT_ENABLED=true
+      - RATE_LIMIT_DEFAULT=100/1m
+      - RATE_LIMIT_TRUST_PROXY=true
+    volumes:
+      - ./examples/proxies-docker.csv:/config/proxies.csv:ro
+    depends_on:
+      - redis
+      - httpbin1
+      - httpbin2
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # Taiji instance 2
+  taiji-2:
+    build:
+      context: .
+      pull: true
+    container_name: taiji-2
+    environment:
+      - PORT=8080
+      - CSV_PATH=/config/proxies.csv
+      - REDIS_ADDR=redis:6379
+      - RATE_LIMIT_ENABLED=true
+      - RATE_LIMIT_DEFAULT=100/1m
+      - RATE_LIMIT_TRUST_PROXY=true
+    volumes:
+      - ./examples/proxies-docker.csv:/config/proxies.csv:ro
+    depends_on:
+      - redis
+      - httpbin1
+      - httpbin2
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # HTTPBin instance 1 (for multi-backend testing)
+  httpbin1:
+    image: kennethreitz/httpbin:latest
+    container_name: taiji-httpbin1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/get"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # HTTPBin instance 2 (for multi-backend testing)
+  httpbin2:
+    image: kennethreitz/httpbin:latest
+    container_name: taiji-httpbin2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/get"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # Redis for distributed rate limiting
+  redis:
+    image: redis:7-alpine
+    container_name: taiji-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  redis-data:
+    driver: local
+
+networks:
+  default:
+    name: taiji-network

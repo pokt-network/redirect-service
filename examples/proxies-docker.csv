@@ -1,0 +1,9 @@
+subdomain,proxy_to,strip_path,strip_query,extra_headers,rate_limit
+httpbin_strip,http://httpbin1/get,true,true,"",""
+httpbin_path,http://httpbin1/anything,false,true,"",""
+httpbin,http://httpbin1,false,false,"",""
+rr_test,http://httpbin1,false,false,"",""
+rr_test,http://httpbin2,false,false,"",""
+custom_headers,http://httpbin1/headers,true,false,"{""X-Custom-Backend"": ""backend-with-headers"", ""X-API-Key"": ""secret123""}",""
+rate_limited,http://httpbin1,false,false,"",10/1m
+rate_generous,http://httpbin1,false,false,"",1000/1h
