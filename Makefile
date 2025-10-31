@@ -89,18 +89,25 @@ LOAD_TEST_REQUESTS ?= 1000
 LOAD_TEST_CONCURRENCY ?= 50
 LOAD_TEST_DURATION ?= 30s
 LOAD_TEST_METHOD ?= eth_blockNumber
+LOAD_TEST_PAYLOAD ?=
 
-load-test: ## Load test production (LOAD_TEST_URL, LOAD_TEST_REQUESTS, LOAD_TEST_CONCURRENCY, LOAD_TEST_DURATION, LOAD_TEST_METHOD)
+load-test: ## Load test production (LOAD_TEST_URL, LOAD_TEST_REQUESTS, LOAD_TEST_CONCURRENCY, LOAD_TEST_DURATION, LOAD_TEST_METHOD or LOAD_TEST_PAYLOAD)
 	@echo "$(COLOR_YELLOW)Load testing $(LOAD_TEST_URL)...$(COLOR_RESET)"
 	@echo "$(COLOR_BOLD)Configuration:$(COLOR_RESET)"
 	@echo "  URL:         $(LOAD_TEST_URL)"
 	@echo "  Requests:    $(LOAD_TEST_REQUESTS)"
 	@echo "  Concurrency: $(LOAD_TEST_CONCURRENCY)"
 	@echo "  Duration:    $(LOAD_TEST_DURATION)"
-	@echo "  Method:      $(LOAD_TEST_METHOD)"
-	@echo ""
 	@command -v hey >/dev/null 2>&1 || { echo "$(COLOR_YELLOW)⚠ 'hey' not found. Installing...$(COLOR_RESET)"; go install github.com/rakyll/hey@latest; }
-	@echo '{"jsonrpc":"2.0","method":"$(LOAD_TEST_METHOD)","params":[],"id":1}' > /tmp/load-test-payload.json
+	@if [ -n "$(LOAD_TEST_PAYLOAD)" ]; then \
+		echo "  Payload:     $(LOAD_TEST_PAYLOAD)"; \
+		echo ""; \
+		echo '$(LOAD_TEST_PAYLOAD)' > /tmp/load-test-payload.json; \
+	else \
+		echo "  Method:      $(LOAD_TEST_METHOD)"; \
+		echo ""; \
+		echo '{"jsonrpc":"2.0","method":"$(LOAD_TEST_METHOD)","params":[],"id":1}' > /tmp/load-test-payload.json; \
+	fi
 	hey -n $(LOAD_TEST_REQUESTS) \
 		-c $(LOAD_TEST_CONCURRENCY) \
 		-z $(LOAD_TEST_DURATION) \

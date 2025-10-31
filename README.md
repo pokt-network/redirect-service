@@ -372,6 +372,41 @@ Run `make help` to see all available targets:
 ./test.sh http://localhost:8080
 ```
 
+### Load Testing
+
+The Makefile includes load testing targets using [hey](https://github.com/rakyll/hey):
+
+```bash
+# Basic load test with default method (eth_blockNumber)
+make load-test \
+  LOAD_TEST_URL=https://eth.api.pocket.network \
+  LOAD_TEST_REQUESTS=5000 \
+  LOAD_TEST_CONCURRENCY=100 \
+  LOAD_TEST_DURATION=60s
+
+# Load test with custom payload (for methods requiring parameters)
+make load-test \
+  LOAD_TEST_URL=https://eth.api.pocket.network \
+  LOAD_TEST_REQUESTS=5000 \
+  LOAD_TEST_CONCURRENCY=100 \
+  LOAD_TEST_DURATION=60s \
+  LOAD_TEST_PAYLOAD='{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params":["0x1b4",true],"id":1}'
+
+# Quick load test (100 requests, 10 concurrent, 10s)
+make load-test-quick
+
+# Stress test (10000 requests, 200 concurrent, 60s)
+make load-test-stress
+```
+
+**Parameters:**
+- `LOAD_TEST_URL`: Target URL (default: `https://eth.api.pocket.network`)
+- `LOAD_TEST_REQUESTS`: Number of requests (default: `1000`)
+- `LOAD_TEST_CONCURRENCY`: Concurrent workers (default: `50`)
+- `LOAD_TEST_DURATION`: Test duration (default: `30s`)
+- `LOAD_TEST_METHOD`: JSON-RPC method with empty params (default: `eth_blockNumber`)
+- `LOAD_TEST_PAYLOAD`: Full custom JSON payload (overrides `LOAD_TEST_METHOD`)
+
 ## License
 
 Copyright © 2025 Pocket Network
