@@ -1,0 +1,88 @@
+# Taiji Proxy Configuration for Docker Compose
+# This file uses docker-compose service names (httpbin1, httpbin2, etc.)
+# Demonstrates all available configuration options including:
+# - Multiple backends per service (round-robin load balancing)
+# - Health checks with configurable method, timeout, and failure threshold
+# - Fallback backends for high availability
+# - Rate limiting per service
+# - Custom headers and path/query manipulation
+
+services:
+  # Basic proxy with path and query stripping
+  - name: httpbin_strip
+    backends:
+      - url: "http://httpbin1/get"
+        strip_path: true
+        strip_query: true
+
+  # Proxy with path preservation
+  - name: httpbin_path
+    backends:
+      - url: "http://httpbin1/anything"
+        strip_path: false
+        strip_query: true
+
+  # Simple proxy without stripping
+  - name: httpbin
+    backends:
+      - url: "http://httpbin1"
+        strip_path: false
+        strip_query: false
+
+  # Round-robin load balancing with multiple backends
+  - name: rr_test
+    backends:
+      - url: "http://httpbin1"
+        strip_path: false
+        strip_query: false
+      - url: "http://httpbin2"
+        strip_path: false
+        strip_query: false
+
+  # Backend with custom headers
+  - name: custom_headers
+    backends:
+      - url: "http://httpbin1/headers"
+        strip_path: true
+        strip_query: false
+        extra_headers: '{"X-Custom-Backend": "backend-with-headers", "X-API-Key": "secret123"}'
+
+  # Service with strict rate limiting
+  - name: rate_limited
+    rate_limit: "10/1m"
+    backends:
+      - url: "http://httpbin1"
+        strip_path: false
+        strip_query: false
+
+  # Service with generous rate limiting
+  - name: rate_generous
+    rate_limit: "1000/1h"
+    backends:
+      - url: "http://httpbin1"
+        strip_path: false
+        strip_query: false
+
+  # Advanced: Health checks with fallback backends
+  # This service demonstrates active + passive health checking with fallback support
+  - name: ha_service
+    rate_limit: "100/1m"
+    health_check:
+      path: "/get"                   # Health check endpoint
+      method: "GET"                  # HTTP method (default: GET, supports POST, PUT, etc.)
+      timeout: 5                     # Timeout in seconds (default: 5)
+      failure_threshold: 3           # Consecutive failures before marking unhealthy (default: 5)
+    backends:
+      # Primary backends - load balanced with round-robin
+      - url: "http://httpbin1"
+        strip_path: false
+        strip_query: false
+      - url: "http://httpbin2"
+        strip_path: false
+        strip_query: false
+    fallbacks:
+      # Fallback backends - only used when all primary backends are unhealthy
+      # In this example, using Redis as a fallback (returns errors, but demonstrates the concept)
+      - url: "http://redis:6379"
+        strip_path: false
+        strip_query: false

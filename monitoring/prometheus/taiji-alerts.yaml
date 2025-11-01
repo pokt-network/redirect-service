@@ -16,7 +16,7 @@ spec:
         # All instances down - PAGE IMMEDIATELY
         - alert: TaijiCompleteOutage
           expr: |
-            (count(up{job="taiji"} == 1) or vector(0)) == 0
+            (count(up{job="taiji",environment="production"} == 1) or vector(0)) == 0
           for: 2m
           labels:
             severity: critical
@@ -30,7 +30,7 @@ spec:
         # Single instance down for a while - lower priority
         - alert: TaijiInstanceDown
           expr: |
-            up{job="taiji"} == 0
+            up{job="taiji",environment="production"} == 0
           for: 10m
           labels:
             severity: warning
@@ -46,9 +46,9 @@ spec:
         - alert: TaijiServiceDegraded
           expr: |
             (
-              sum(rate(proxy_requests_total{job="taiji",status_code=~"5.."}[10m]))
+              sum(rate(proxy_requests_total{job="taiji",environment="production",status_code=~"5.."}[10m]))
               /
-              sum(rate(proxy_requests_total{job="taiji"}[10m]))
+              sum(rate(proxy_requests_total{job="taiji",environment="production"}[10m]))
             ) > 0.10
           for: 15m
           labels:
@@ -66,9 +66,9 @@ spec:
         - alert: TaijiSubdomainDegraded
           expr: |
             (
-              sum by (subdomain) (rate(proxy_requests_total{job="taiji",status_code=~"5.."}[15m]))
+              sum by (subdomain) (rate(proxy_requests_total{job="taiji",environment="production",status_code=~"5.."}[15m]))
               /
-              sum by (subdomain) (rate(proxy_requests_total{job="taiji"}[15m]))
+              sum by (subdomain) (rate(proxy_requests_total{job="taiji",environment="production"}[15m]))
             ) > 0.20
           for: 20m
           labels:
@@ -84,7 +84,7 @@ spec:
 
         - alert: TaijiRateLimitingDegraded
           expr: |
-            sum(rate(proxy_ratelimit_redis_errors_total{job="taiji"}[5m])) > 5
+            sum(rate(proxy_ratelimit_redis_errors_total{job="taiji",environment="production"}[5m])) > 5
           for: 10m
           labels:
             severity: warning
@@ -101,9 +101,9 @@ spec:
         - alert: TaijiHighRateLimitBlocking
           expr: |
             (
-              sum by (subdomain) (rate(proxy_ratelimit_requests_total{job="taiji",action="blocked"}[1h]))
+              sum by (subdomain) (rate(proxy_ratelimit_requests_total{job="taiji",environment="production",action="blocked"}[1h]))
               /
-              sum by (subdomain) (rate(proxy_ratelimit_requests_total{job="taiji"}[1h]))
+              sum by (subdomain) (rate(proxy_ratelimit_requests_total{job="taiji",environment="production"}[1h]))
             ) > 0.50
           for: 1h
           labels:
@@ -122,9 +122,9 @@ spec:
         - alert: TaijiProxyOverheadPercentageHigh
           expr: |
             (
-              sum(rate(proxy_overhead_duration_seconds_sum{job="taiji"}[15m]))
+              sum(rate(proxy_overhead_duration_seconds_sum{job="taiji",environment="production"}[15m]))
               /
-              sum(rate(proxy_request_duration_seconds_sum{job="taiji"}[15m]))
+              sum(rate(proxy_request_duration_seconds_sum{job="taiji",environment="production"}[15m]))
             ) > 0.30
           for: 30m
           labels:
@@ -140,7 +140,7 @@ spec:
 
         - alert: TaijiConfigReloadFailing
           expr: |
-            rate(proxy_csv_reload_errors_total{job="taiji"}[10m]) > 0
+            rate(proxy_csv_reload_errors_total{job="taiji",environment="production"}[10m]) > 0
           for: 15m
           labels:
             severity: warning
@@ -148,8 +148,24 @@ spec:
             team: platform
           annotations:
             summary: "Taiji configuration reload failing"
-            description: "CSV reload errors detected for 15+ minutes."
-            action: "Check ConfigMap/CSV file syntax and mount."
+            description: "YAML reload errors detected for 15+ minutes."
+            action: "Check ConfigMap/YAML file syntax and mount."
+
+        # ===== CRITICAL: All Backends Down =====
+
+        # All backends unhealthy for a service - critical impact
+        - alert: TaijiAllBackendsUnhealthy
+          expr: |
+            sum by (subdomain) (rate(proxy_all_backends_unhealthy_total{job="taiji",environment="production"}[5m])) > 0
+          for: 10m
+          labels:
+            severity: critical
+            service: taiji
+            team: platform
+          annotations:
+            summary: "🚨 All backends down for {{ $labels.subdomain }}"
+            description: "Service {{ $labels.subdomain }} has NO healthy backends for 10+ minutes. Returning 503 errors."
+            action: "Check backend health, network connectivity, and health check configuration."
 
     # ===== DAILY SUMMARY ALERTS (BATCH NOTIFICATIONS) =====
     - name: taiji.daily-summary
@@ -159,12 +175,12 @@ spec:
         - alert: TaijiBackendHealthSummary
           expr: |
             (
-              sum by (subdomain, backend) (rate(proxy_requests_total{job="taiji",status_code=~"5.."}[24h]))
+              sum by (subdomain, backend) (rate(proxy_requests_total{job="taiji",environment="production",status_code=~"5.."}[24h]))
               /
-              sum by (subdomain, backend) (rate(proxy_requests_total{job="taiji"}[24h]))
+              sum by (subdomain, backend) (rate(proxy_requests_total{job="taiji",environment="production"}[24h]))
             ) > 0.05
             and
-            sum by (subdomain, backend) (rate(proxy_requests_total{job="taiji"}[24h])) > 0.01
+            sum by (subdomain, backend) (rate(proxy_requests_total{job="taiji",environment="production"}[24h])) > 0.01
           for: 1h
           labels:
             severity: info
@@ -179,7 +195,7 @@ spec:
         - alert: TaijiHighLatencySummary
           expr: |
             histogram_quantile(0.99,
-              sum by (le, subdomain) (rate(proxy_request_duration_seconds_bucket{job="taiji"}[24h]))
+              sum by (le, subdomain) (rate(proxy_request_duration_seconds_bucket{job="taiji",environment="production"}[24h]))
             ) > 2
           for: 2h
           labels:

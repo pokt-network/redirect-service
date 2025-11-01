@@ -1,13 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"context"
-	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"net"
@@ -28,20 +25,23 @@ import (
 	"time"
 
 	"atomicgo.dev/robin"
+	"github.com/alitto/pond"
 	"github.com/fsnotify/fsnotify"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/puzpuzpuz/xsync/v4"
 	"github.com/redis/go-redis/v9"
+	"github.com/robfig/cron/v3"
 	"golang.org/x/net/http2"
+	"gopkg.in/yaml.v3"
 )
 
 // contextKey is a custom type for context keys to avoid collisions
 type contextKey string
 
 const (
-	defaultCSVPath        = "examples/proxies.csv"
+	defaultCSVPath        = "examples/proxies.yaml"
 	defaultPort           = "8080"
 	proxyMetadataField    = contextKey("proxy_metadata")
 	backendStartTimeField = contextKey("backend_start_time")
@@ -182,11 +182,68 @@ var (
 		Help:    "Duration of rate limit checks (Redis latency)",
 		Buckets: []float64{0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1}, // 1ms to 100ms
 	})
+
+	// Health check metrics
+	proxyBackendHealthStatus = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "proxy_backend_health_status",
+		Help: "Backend health status (1=healthy, 0=unhealthy) by subdomain and backend",
+	}, []string{"subdomain", "backend"})
+
+	proxyHealthChecksTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "proxy_health_checks_total",
+		Help: "Total number of health checks performed by subdomain, backend, and result",
+	}, []string{"subdomain", "backend", "result"}) // result: "success" or "failure"
+
+	// Fallback metrics
+	proxyFallbackRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "proxy_fallback_requests_total",
+		Help: "Total number of requests routed to fallback backends by subdomain",
+	}, []string{"subdomain"})
+
+	proxyAllBackendsUnhealthyTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "proxy_all_backends_unhealthy_total",
+		Help: "Total number of 503 responses due to all backends being unhealthy by subdomain",
+	}, []string{"subdomain"})
 )
 
 type RateLimitConfig struct {
 	Requests int           // Number of requests allowed
 	Window   time.Duration // Time window for rate limit
+}
+
+// YAML Configuration Structs
+type YAMLConfig struct {
+	Services []ServiceConfig `yaml:"services"`
+}
+
+type ServiceConfig struct {
+	Name        string             `yaml:"name"`
+	RateLimit   string             `yaml:"rate_limit"`
+	HealthCheck *HealthCheckConfig `yaml:"health_check,omitempty"`
+	Backends    []BackendConfig    `yaml:"backends"`
+	Fallbacks   []BackendConfig    `yaml:"fallbacks,omitempty"`
+}
+
+type BackendConfig struct {
+	URL          string `yaml:"url"`
+	StripPath    bool   `yaml:"strip_path"`
+	StripQuery   bool   `yaml:"strip_query"`
+	ExtraHeaders string `yaml:"extra_headers,omitempty"`
+}
+
+type HealthCheckConfig struct {
+	Path             string `yaml:"path"`
+	Method           string `yaml:"method,omitempty"`            // HTTP method (default: GET)
+	Payload          string `yaml:"payload,omitempty"`           // Request body for POST/PUT
+	Timeout          int    `yaml:"timeout,omitempty"`           // Timeout in seconds (default: 5)
+	FailureThreshold int    `yaml:"failure_threshold,omitempty"` // Number of consecutive failures before marking unhealthy (default: 5)
+}
+
+// BackendHealth tracks the health status of a backend using atomic operations for thread-safety
+type BackendHealth struct {
+	healthy             atomic.Bool  // Current health status
+	consecutiveFailures atomic.Int32 // Consecutive failure count
+	lastCheck           atomic.Value // Stores time.Time - last health check timestamp
 }
 
 type ProxyRule struct {
@@ -198,17 +255,22 @@ type ProxyRule struct {
 }
 
 type ProxyService struct {
-	rules            atomic.Value // map[string][]ProxyRule - multiple backends per subdomain
-	csvPath          string
-	loadTime         atomic.Value // time.Time
-	ruleCount        atomic.Int64
-	transport        *http.Transport
-	proxies          sync.Map                                           // map[string]*httputil.ReverseProxy - cached per backend
-	loadbalancers    *xsync.Map[string, *robin.Loadbalancer[ProxyRule]] // round-robin loadbalancer per subdomain
-	rateLimiter      *RateLimiter
-	rateLimitEnabled bool
-	defaultRateLimit *RateLimitConfig
-	trustProxy       bool
+	rules              atomic.Value // map[string][]ProxyRule - multiple backends per subdomain
+	csvPath            string
+	loadTime           atomic.Value // time.Time
+	ruleCount          atomic.Int64
+	transport          *http.Transport
+	proxies            sync.Map                                           // map[string]*httputil.ReverseProxy - cached per backend
+	loadbalancers      *xsync.Map[string, *robin.Loadbalancer[ProxyRule]] // round-robin loadbalancer per subdomain
+	rateLimiter        *RateLimiter
+	rateLimitEnabled   bool
+	defaultRateLimit   *RateLimitConfig
+	trustProxy         bool
+	healthStates       *xsync.Map[string, *BackendHealth]     // Backend health status by URL
+	fallbackRules      *xsync.Map[string, []ProxyRule]        // Fallback backends per subdomain
+	healthCheckConfigs *xsync.Map[string, *HealthCheckConfig] // Health check config by subdomain
+	healthCheckPool    *pond.WorkerPool                       // Worker pool for health checks
+	healthCheckCron    *cron.Cron                             // Cron scheduler for health checks
 }
 
 type RateLimiter struct {
@@ -457,154 +519,207 @@ func NewProxyService(csvPath string, rateLimiter *RateLimiter, rateLimitEnabled 
 		log.Printf("main.go:456: WARN: Failed to configure HTTP/2 transport: %v", err)
 	}
 
+	// Initialize health check worker pool (10 workers, 100 task buffer)
+	healthCheckPool := pond.New(10, 100)
+
+	// Initialize cron scheduler for health checks
+	healthCheckCron := cron.New()
+
 	s := &ProxyService{
-		csvPath:          csvPath,
-		rateLimiter:      rateLimiter,
-		rateLimitEnabled: rateLimitEnabled,
-		defaultRateLimit: defaultRateLimit,
-		trustProxy:       trustProxy,
-		loadbalancers:    xsync.NewMap[string, *robin.Loadbalancer[ProxyRule]](),
-		transport:        transport,
+		csvPath:            csvPath,
+		rateLimiter:        rateLimiter,
+		rateLimitEnabled:   rateLimitEnabled,
+		defaultRateLimit:   defaultRateLimit,
+		trustProxy:         trustProxy,
+		loadbalancers:      xsync.NewMap[string, *robin.Loadbalancer[ProxyRule]](),
+		transport:          transport,
+		healthStates:       xsync.NewMap[string, *BackendHealth](),
+		fallbackRules:      xsync.NewMap[string, []ProxyRule](),
+		healthCheckConfigs: xsync.NewMap[string, *HealthCheckConfig](),
+		healthCheckPool:    healthCheckPool,
+		healthCheckCron:    healthCheckCron,
 	}
 	s.rules.Store(make(map[string][]ProxyRule))
 	s.loadTime.Store(time.Now())
 	return s
 }
 
-// LoadRules parses CSV and loads proxy rules with full validation
+// LoadRules parses YAML configuration and loads proxy rules with health checks and fallbacks
 func (s *ProxyService) LoadRules() error {
 	proxyCSVReloadTotal.Inc()
 
-	file, err := os.Open(s.csvPath)
+	// Read YAML file
+	data, err := os.ReadFile(s.csvPath)
 	if err != nil {
 		proxyCSVReloadErrorsTotal.Inc()
-		return fmt.Errorf("failed to open CSV file: %w", err)
+		return fmt.Errorf("failed to read YAML file: %w", err)
 	}
-	defer func(file *os.File) {
-		_ = file.Close()
-	}(file)
 
-	reader := csv.NewReader(bufio.NewReader(file))
-	reader.TrimLeadingSpace = true
-	reader.FieldsPerRecord = -1 // Accept variable number of fields (4, 5, or 6)
-	reader.LazyQuotes = true    // Allow lazy quote handling for JSON strings
+	// Parse YAML
+	var config YAMLConfig
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		proxyCSVReloadErrorsTotal.Inc()
+		return fmt.Errorf("failed to parse YAML: %w", err)
+	}
+
+	if len(config.Services) == 0 {
+		proxyCSVReloadErrorsTotal.Inc()
+		return fmt.Errorf("no services defined in YAML")
+	}
 
 	newRules := make(map[string][]ProxyRule)
-	lineNum := 0
+	newFallbacks := xsync.NewMap[string, []ProxyRule]()
+	newHealthCheckConfigs := xsync.NewMap[string, *HealthCheckConfig]()
+	newHealthStates := xsync.NewMap[string, *BackendHealth]()
 
-	for {
-		record, err := reader.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			proxyCSVReloadErrorsTotal.Inc()
-			return fmt.Errorf("CSV parse error at line %d: %w", lineNum, err)
-		}
+	totalBackends := 0
+	totalFallbacks := 0
 
-		lineNum++
-
-		// Skip header
-		if lineNum == 1 && record[0] == "subdomain" {
-			continue
-		}
-
-		// Validate field count (4, 5, or 6 columns)
-		if len(record) < 4 || len(record) > 6 {
-			log.Printf("WARN: Invalid field count at line %d (expected 4-6, got %d), skipping", lineNum, len(record))
-			continue
-		}
-
-		// Validate subdomain (no empty, no wildcards, no dots)
-		subdomain := strings.TrimSpace(record[0])
+	// Process each service
+	for i, svc := range config.Services {
+		// Validate service name (used as subdomain)
+		subdomain := strings.TrimSpace(svc.Name)
 		if subdomain == "" || strings.Contains(subdomain, ".") || strings.Contains(subdomain, "*") {
-			log.Printf("WARN: Invalid subdomain '%s' at line %d, skipping", subdomain, lineNum)
+			log.Printf("WARN: Invalid service name '%s' at index %d, skipping", subdomain, i)
 			continue
 		}
 
-		// Validate proxy_to (must not be empty)
-		proxyTo := strings.TrimSpace(record[1])
-		if proxyTo == "" {
-			log.Printf("WARN: Empty proxy_to for subdomain '%s' at line %d, skipping", subdomain, lineNum)
-			continue
-		}
-
-		// Parse booleans with error handling
-		stripPath, err := strconv.ParseBool(strings.TrimSpace(record[2]))
-		if err != nil {
-			log.Printf("WARN: Invalid strip_path '%s' for subdomain '%s' at line %d, defaulting to false", record[2], subdomain, lineNum)
-			stripPath = false
-		}
-
-		stripQuery, err := strconv.ParseBool(strings.TrimSpace(record[3]))
-		if err != nil {
-			log.Printf("WARN: Invalid strip_query '%s' for subdomain '%s' at line %d, defaulting to false", record[3], subdomain, lineNum)
-			stripQuery = false
-		}
-
-		// Parse extra_headers JSON (5th column, optional)
-		var extraHeaders map[string]string
-		if len(record) >= 5 {
-			extraHeadersStr := strings.TrimSpace(record[4])
-			if extraHeadersStr != "" {
-				if err := json.Unmarshal([]byte(extraHeadersStr), &extraHeaders); err != nil {
-					log.Printf("WARN: Invalid extra_headers JSON for subdomain '%s' at line %d: %v, skipping extra headers", subdomain, lineNum, err)
-					extraHeaders = nil
-				}
-			}
-		}
-
-		// Parse rate_limit (6th column, optional)
+		// Parse rate limit
 		var rateLimit *RateLimitConfig
-		if len(record) == 6 {
-			rateLimitStr := strings.TrimSpace(record[5])
-			if rateLimitStr != "" {
-				parsedLimit, err := parseRateLimit(rateLimitStr)
-				if err != nil {
-					log.Printf("WARN: Invalid rate_limit '%s' for subdomain '%s' at line %d: %v, using default", rateLimitStr, subdomain, lineNum, err)
-					rateLimit = nil
-				} else {
-					rateLimit = parsedLimit
-				}
+		if svc.RateLimit != "" {
+			parsed, err := parseRateLimit(svc.RateLimit)
+			if err != nil {
+				log.Printf("WARN: Invalid rate_limit '%s' for service '%s': %v, using default", svc.RateLimit, subdomain, err)
+			} else {
+				rateLimit = parsed
 			}
 		}
 
-		// Append rule to subdomain's backend list
-		newRules[subdomain] = append(newRules[subdomain], ProxyRule{
-			ProxyTo:      proxyTo,
-			StripPath:    stripPath,
-			StripQuery:   stripQuery,
-			ExtraHeaders: extraHeaders,
-			RateLimit:    rateLimit,
-		})
+		// Process primary backends
+		var backends []ProxyRule
+		for j, backend := range svc.Backends {
+			rule, err := s.parseBackendConfig(backend, rateLimit, subdomain, j, false)
+			if err != nil {
+				log.Printf("WARN: Skipping backend %d for service '%s': %v", j, subdomain, err)
+				continue
+			}
+			backends = append(backends, rule)
+			totalBackends++
+
+			// Initialize or preserve health state for this backend
+			existingHealth, exists := s.healthStates.Load(rule.ProxyTo)
+			if exists {
+				// Preserve existing health state on reload
+				newHealthStates.Store(rule.ProxyTo, existingHealth)
+			} else {
+				// New backend - start as healthy
+				health := &BackendHealth{}
+				health.healthy.Store(true)
+				health.consecutiveFailures.Store(0)
+				health.lastCheck.Store(time.Now())
+				newHealthStates.Store(rule.ProxyTo, health)
+			}
+		}
+
+		if len(backends) == 0 {
+			log.Printf("WARN: No valid backends for service '%s', skipping", subdomain)
+			continue
+		}
+
+		newRules[subdomain] = backends
+
+		// Process fallback backends (optional)
+		if len(svc.Fallbacks) > 0 {
+			var fallbacks []ProxyRule
+			for j, fallback := range svc.Fallbacks {
+				rule, err := s.parseBackendConfig(fallback, rateLimit, subdomain, j, true)
+				if err != nil {
+					log.Printf("WARN: Skipping fallback %d for service '%s': %v", j, subdomain, err)
+					continue
+				}
+				fallbacks = append(fallbacks, rule)
+				totalFallbacks++
+
+				// Initialize or preserve health state for fallback
+				existingHealth, exists := s.healthStates.Load(rule.ProxyTo)
+				if exists {
+					// Preserve existing health state on reload
+					newHealthStates.Store(rule.ProxyTo, existingHealth)
+				} else {
+					// New fallback - start as healthy
+					health := &BackendHealth{}
+					health.healthy.Store(true)
+					health.consecutiveFailures.Store(0)
+					health.lastCheck.Store(time.Now())
+					newHealthStates.Store(rule.ProxyTo, health)
+				}
+			}
+			if len(fallbacks) > 0 {
+				newFallbacks.Store(subdomain, fallbacks)
+			}
+		}
+
+		// Store health check config if provided
+		if svc.HealthCheck != nil {
+			// Set default failure threshold if not specified
+			if svc.HealthCheck.FailureThreshold <= 0 {
+				svc.HealthCheck.FailureThreshold = 5 // Default: 5 consecutive failures
+			}
+			newHealthCheckConfigs.Store(subdomain, svc.HealthCheck)
+		}
 	}
 
 	if len(newRules) == 0 {
 		proxyCSVReloadErrorsTotal.Inc()
-		return fmt.Errorf("no valid proxy rules loaded from CSV")
+		return fmt.Errorf("no valid services loaded from YAML")
 	}
 
-	// Count total backends across all subdomains
-	totalBackends := 0
-	for _, backends := range newRules {
-		totalBackends += len(backends)
-	}
-
-	// Atomic swap
+	// Atomic swap of rules
 	s.rules.Store(newRules)
 	now := time.Now()
 	s.loadTime.Store(now)
 	s.ruleCount.Store(int64(len(newRules)))
 
-	// Rebuild loadbalancers for all subdomains (happens on CSV reload only, rare)
+	// Rebuild loadbalancers for primary backends
 	newLoadbalancers := xsync.NewMap[string, *robin.Loadbalancer[ProxyRule]]()
 	for subdomain, backends := range newRules {
 		if len(backends) > 0 {
 			newLoadbalancers.Store(subdomain, robin.NewLoadbalancer(backends))
 		}
 	}
-	// Atomic swap - old loadbalancers will be GC'd when no requests reference them
 	s.loadbalancers = newLoadbalancers
+
+	// Track health check changes (additions/removals)
+	var addedHealthChecks, removedHealthChecks []string
+
+	// Check for removed health checks
+	s.healthCheckConfigs.Range(func(subdomain string, oldConfig *HealthCheckConfig) bool {
+		if _, exists := newHealthCheckConfigs.Load(subdomain); !exists {
+			removedHealthChecks = append(removedHealthChecks, subdomain)
+		}
+		return true
+	})
+
+	// Check for added health checks
+	newHealthCheckConfigs.Range(func(subdomain string, newConfig *HealthCheckConfig) bool {
+		if _, exists := s.healthCheckConfigs.Load(subdomain); !exists {
+			addedHealthChecks = append(addedHealthChecks, subdomain)
+		}
+		return true
+	})
+
+	// Log health check changes
+	if len(addedHealthChecks) > 0 {
+		log.Printf("INFO: Health checks added for services: %v", addedHealthChecks)
+	}
+	if len(removedHealthChecks) > 0 {
+		log.Printf("INFO: Health checks removed for services: %v", removedHealthChecks)
+	}
+
+	// Atomic swap of health-related data
+	s.fallbackRules = newFallbacks
+	s.healthCheckConfigs = newHealthCheckConfigs
+	s.healthStates = newHealthStates
 
 	// Update Prometheus metrics
 	proxyRulesTotal.Set(float64(totalBackends))
@@ -616,13 +731,291 @@ func (s *ProxyService) LoadRules() error {
 		proxyRuleActive.WithLabelValues(subdomain).Set(1)
 	}
 
-	log.Printf("INFO: Loaded %d subdomains with %d total backends from %s", len(newRules), totalBackends, s.csvPath)
+	// Initialize health states in metrics
+	s.healthStates.Range(func(backendURL string, health *BackendHealth) bool {
+		// Extract subdomain from rules (reverse lookup)
+		for subdomain, backends := range newRules {
+			for _, backend := range backends {
+				if backend.ProxyTo == backendURL {
+					healthValue := 0.0
+					if health.healthy.Load() {
+						healthValue = 1.0
+					}
+					proxyBackendHealthStatus.WithLabelValues(subdomain, backendURL).Set(healthValue)
+					break
+				}
+			}
+		}
+		return true
+	})
+
+	log.Printf("INFO: Loaded %d services with %d primary backends and %d fallback backends from %s",
+		len(newRules), totalBackends, totalFallbacks, s.csvPath)
 	return nil
+}
+
+// parseBackendConfig converts a BackendConfig to a ProxyRule
+func (s *ProxyService) parseBackendConfig(backend BackendConfig, rateLimit *RateLimitConfig, serviceName string, index int, isFallback bool) (ProxyRule, error) {
+	backendType := "backend"
+	if isFallback {
+		backendType = "fallback"
+	}
+
+	// Validate URL
+	url := strings.TrimSpace(backend.URL)
+	if url == "" {
+		return ProxyRule{}, fmt.Errorf("empty URL for %s %d", backendType, index)
+	}
+
+	// Parse extra headers if provided
+	var extraHeaders map[string]string
+	if backend.ExtraHeaders != "" {
+		if err := json.Unmarshal([]byte(backend.ExtraHeaders), &extraHeaders); err != nil {
+			return ProxyRule{}, fmt.Errorf("invalid extra_headers JSON for %s %d: %w", backendType, index, err)
+		}
+	}
+
+	return ProxyRule{
+		ProxyTo:      url,
+		StripPath:    backend.StripPath,
+		StripQuery:   backend.StripQuery,
+		ExtraHeaders: extraHeaders,
+		RateLimit:    rateLimit,
+	}, nil
 }
 
 // GetRules returns current rules (thread-safe)
 func (s *ProxyService) GetRules() map[string][]ProxyRule {
 	return s.rules.Load().(map[string][]ProxyRule)
+}
+
+// StartHealthChecker starts the cron-based health check scheduler
+func (s *ProxyService) StartHealthChecker() {
+	// Schedule health checks every 10 seconds (faster recovery with passive health checks)
+	_, err := s.healthCheckCron.AddFunc("@every 10s", s.runHealthChecks)
+	if err != nil {
+		log.Printf("ERROR: Failed to schedule health checks: %v", err)
+		return
+	}
+
+	// Start the cron scheduler
+	s.healthCheckCron.Start()
+	log.Printf("INFO: Health checker started (runs every 10s)")
+}
+
+// runHealthChecks executes health checks for all services with health check configs
+func (s *ProxyService) runHealthChecks() {
+	rules := s.GetRules()
+
+	// Iterate over all services and check each backend
+	for subdomain, backends := range rules {
+		// Check if this service has health check configured
+		healthCheckConfig, hasHealthCheck := s.healthCheckConfigs.Load(subdomain)
+		if !hasHealthCheck {
+			continue // No health check for this service - always healthy
+		}
+
+		// Submit health check task for each primary backend
+		for _, backend := range backends {
+			backendURL := backend.ProxyTo
+			config := healthCheckConfig
+
+			// Submit to worker pool (non-blocking)
+			s.healthCheckPool.Submit(func() {
+				s.performHealthCheck(subdomain, backendURL, config)
+			})
+		}
+
+		// Also check fallback backends if they exist
+		fallbacks, hasFallbacks := s.fallbackRules.Load(subdomain)
+		if hasFallbacks {
+			for _, fallback := range fallbacks {
+				backendURL := fallback.ProxyTo
+				config := healthCheckConfig
+
+				s.healthCheckPool.Submit(func() {
+					s.performHealthCheck(subdomain, backendURL, config)
+				})
+			}
+		}
+	}
+}
+
+// performHealthCheck executes a single health check against a backend
+func (s *ProxyService) performHealthCheck(subdomain, backendURL string, config *HealthCheckConfig) {
+	// Load health state (should always exist)
+	health, exists := s.healthStates.Load(backendURL)
+	if !exists {
+		log.Printf("WARN: No health state found for backend %s", backendURL)
+		return
+	}
+
+	// Construct full URL for health check
+	fullURL := backendURL + config.Path
+
+	// Determine HTTP method (default: GET)
+	method := "GET"
+	if config.Method != "" {
+		method = strings.ToUpper(config.Method)
+	}
+
+	// Determine timeout (default: 5 seconds)
+	timeout := 5 * time.Second
+	if config.Timeout > 0 {
+		timeout = time.Duration(config.Timeout) * time.Second
+	}
+
+	// Create HTTP client with configurable timeout
+	client := &http.Client{
+		Timeout:   timeout,
+		Transport: s.transport,
+	}
+
+	// Create request with configurable method and optional payload
+	var reqBody *strings.Reader
+	if config.Payload != "" {
+		reqBody = strings.NewReader(config.Payload)
+	}
+
+	var req *http.Request
+	var err error
+	if reqBody != nil {
+		req, err = http.NewRequest(method, fullURL, reqBody)
+	} else {
+		req, err = http.NewRequest(method, fullURL, nil)
+	}
+
+	if err != nil {
+		log.Printf("ERROR: Failed to create health check request for %s: %v", backendURL, err)
+		s.recordHealthCheckFailure(subdomain, backendURL, health)
+		return
+	}
+
+	// Set Content-Type only if we have a payload
+	if config.Payload != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		// Connection error or timeout
+		s.recordHealthCheckFailure(subdomain, backendURL, health)
+		return
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Printf("WARN: Failed to close response body for health check %s: %v", backendURL, err)
+		}
+	}()
+
+	// Check if response is 2xx (success)
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// Health check passed
+		s.recordHealthCheckSuccess(subdomain, backendURL, health)
+	} else {
+		// Non-2xx status code - health check failed
+		s.recordHealthCheckFailure(subdomain, backendURL, health)
+	}
+}
+
+// recordHealthCheckSuccess marks a backend as healthy after successful check
+func (s *ProxyService) recordHealthCheckSuccess(subdomain, backendURL string, health *BackendHealth) {
+	// Reset consecutive failures
+	health.consecutiveFailures.Store(0)
+
+	// Mark as healthy
+	wasHealthy := health.healthy.Load()
+	health.healthy.Store(true)
+	health.lastCheck.Store(time.Now())
+
+	// Update metrics
+	proxyHealthChecksTotal.WithLabelValues(subdomain, backendURL, "success").Inc()
+	proxyBackendHealthStatus.WithLabelValues(subdomain, backendURL).Set(1)
+
+	// Log if backend recovered
+	if !wasHealthy {
+		log.Printf("INFO: Backend %s for service %s is now healthy", backendURL, subdomain)
+	}
+}
+
+// recordHealthCheckFailure marks a backend as unhealthy after failed check
+func (s *ProxyService) recordHealthCheckFailure(subdomain, backendURL string, health *BackendHealth) {
+	// Increment consecutive failures
+	failures := health.consecutiveFailures.Add(1)
+
+	// Update last check time
+	health.lastCheck.Store(time.Now())
+
+	// Get configurable failure threshold (default: 5)
+	threshold := int32(5)
+	if config, exists := s.healthCheckConfigs.Load(subdomain); exists {
+		if config.FailureThreshold > 0 {
+			threshold = int32(config.FailureThreshold)
+		}
+	}
+
+	// Mark unhealthy after reaching failure threshold
+	wasHealthy := health.healthy.Load()
+	if failures >= threshold {
+		health.healthy.Store(false)
+		proxyBackendHealthStatus.WithLabelValues(subdomain, backendURL).Set(0)
+
+		// Log if backend just became unhealthy
+		if wasHealthy {
+			log.Printf("WARN: Backend %s for service %s is now unhealthy after %d consecutive failures (threshold: %d)", backendURL, subdomain, failures, threshold)
+		}
+	}
+
+	// Update metrics
+	proxyHealthChecksTotal.WithLabelValues(subdomain, backendURL, "failure").Inc()
+}
+
+// isBackendHealthy checks if a backend is healthy
+// If no health check is configured for the service, always returns true
+func (s *ProxyService) isBackendHealthy(subdomain, backendURL string) bool {
+	// Check if health checks are configured for this service
+	_, hasHealthCheck := s.healthCheckConfigs.Load(subdomain)
+	if !hasHealthCheck {
+		return true // No health check = always healthy
+	}
+
+	// Load health state
+	health, exists := s.healthStates.Load(backendURL)
+	if !exists {
+		return true // No state yet = assume healthy
+	}
+
+	return health.healthy.Load()
+}
+
+// filterHealthyBackends returns only the healthy backends from a list
+func (s *ProxyService) filterHealthyBackends(subdomain string, backends []ProxyRule) []ProxyRule {
+	var healthy []ProxyRule
+	for _, backend := range backends {
+		if s.isBackendHealthy(subdomain, backend.ProxyTo) {
+			healthy = append(healthy, backend)
+		}
+	}
+	return healthy
+}
+
+// recordPassiveHealthCheckFailure records a backend failure from actual request traffic (passive health check)
+// This provides faster failure detection compared to active health checks (cron-based)
+func (s *ProxyService) recordPassiveHealthCheckFailure(subdomain, backendURL string) {
+	// Only track passive health for backends that have active health checks configured
+	_, hasHealthCheck := s.healthCheckConfigs.Load(subdomain)
+	if !hasHealthCheck {
+		return // No health check configured, don't track passive health
+	}
+
+	// Load health state
+	health, exists := s.healthStates.Load(backendURL)
+	if !exists {
+		return // No health state = no health check configured
+	}
+
+	// Use the same failure tracking logic as active health checks
+	s.recordHealthCheckFailure(subdomain, backendURL, health)
 }
 
 // HandleProxy processes incoming requests and proxies them to the configured backend(s)
@@ -665,6 +1058,33 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Not Found: No proxy rule for this subdomain", http.StatusNotFound)
 		return
 	}
+
+	// Filter to healthy backends
+	healthyBackends := s.filterHealthyBackends(subdomain, backends)
+
+	// If no healthy primary backends, try fallbacks
+	if len(healthyBackends) == 0 {
+		fallbacks, hasFallbacks := s.fallbackRules.Load(subdomain)
+		if hasFallbacks {
+			healthyFallbacks := s.filterHealthyBackends(subdomain, fallbacks)
+			if len(healthyFallbacks) > 0 {
+				healthyBackends = healthyFallbacks
+				proxyFallbackRequestsTotal.WithLabelValues(subdomain).Inc()
+				log.Printf("INFO: Using fallback backends for subdomain %s (all primary backends unhealthy)", subdomain)
+			}
+		}
+	}
+
+	// If still no healthy backends, return 503
+	if len(healthyBackends) == 0 {
+		proxyAllBackendsUnhealthyTotal.WithLabelValues(subdomain).Inc()
+		proxyRequestsTotal.WithLabelValues(subdomain, "unknown", "503").Inc()
+		http.Error(w, "Service Unavailable: All backends are unhealthy", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Use healthy backends for the request
+	backends = healthyBackends
 
 	// Get client IP using proper extraction (handles HAProxy/Cloudflare headers)
 	clientIP := extractClientIP(r, s.trustProxy)
@@ -851,6 +1271,12 @@ func (s *ProxyService) tryBackend(w http.ResponseWriter, r *http.Request, subdom
 
 		// Retryable error (5xx or 429), track backend failure and continue to next backend
 		proxyBackendFailuresTotal.WithLabelValues(subdomain, backend).Inc()
+
+		// Passive health check: mark backend unhealthy on 5xx errors
+		if rec.Code >= 500 {
+			s.recordPassiveHealthCheckFailure(subdomain, rule.ProxyTo)
+		}
+
 		log.Printf("WARN: Backend %s failed for subdomain '%s' with status %d (retryable), trying next backend", backend, subdomain, rec.Code)
 		return false, rec.Code, false
 	}
@@ -987,6 +1413,9 @@ func (s *ProxyService) createReverseProxy() *httputil.ReverseProxy {
 			if meta, ok := req.Context().Value(proxyMetadataField).(proxyMetadata); ok {
 				log.Printf("ERROR: Backend request failed for subdomain '%s' backend '%s': %v", meta.subdomain, meta.backend, err)
 				proxyRequestsTotal.WithLabelValues(meta.subdomain, meta.backend, statusCodeStrings[502]).Inc()
+
+				// Passive health check: mark backend unhealthy on connection errors
+				s.recordPassiveHealthCheckFailure(meta.subdomain, meta.rule.ProxyTo)
 			}
 			http.Error(w, "Bad Gateway: Backend request failed", http.StatusBadGateway)
 		},
@@ -1186,7 +1615,7 @@ func (s *ProxyService) StartWatcherWithRestart(ctx context.Context) {
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Println("INFO: Starting Taiji (太极) - High-performance reverse proxy...")
+	log.Println("INFO: Starting Taiji (太极) v1.3.0 - High-performance reverse proxy...")
 
 	// Enable pprof profiling
 	runtime.SetMutexProfileFraction(1) // Enable mutex profiling
@@ -1299,6 +1728,9 @@ func main() {
 		log.Fatalf("FATAL: Failed to load initial rules: %v", err)
 	}
 
+	// Start health checker
+	service.StartHealthChecker()
+
 	// Set up a graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1343,6 +1775,12 @@ func main() {
 
 	// Cancel context to stop watchers
 	cancel()
+
+	// Stop health checker
+	log.Println("INFO: Stopping health checker...")
+	service.healthCheckCron.Stop()
+	service.healthCheckPool.StopAndWait()
+	log.Println("INFO: Health checker stopped")
 
 	// Graceful shutdown with timeout
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)

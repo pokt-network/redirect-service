@@ -25,4 +25,8 @@ Thumbs.db
 # Local development
 /tmp/
 *.local.csv
-proxies.csv
+
+# local copies for development (root level only)
+/proxies.csv
+/proxies.yaml
+/proxies.yaml.backup

@@ -9,7 +9,7 @@ data:
   taiji-dashboard.json: |-
     {
       "annotations": {"list": []},
-      "description": "Taiji reverse proxy monitoring with multi-backend support",
+      "description": "Taiji reverse proxy monitoring - Reorganized for clarity with P95 focus",
       "editable": true,
       "gnetId": null,
       "graphTooltip": 1,
@@ -21,7 +21,7 @@ data:
           "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
           "id": 100,
           "panels": [],
-          "title": "Service Health",
+          "title": "🔥 Critical Health - P95 Metrics",
           "type": "row"
         },
         {
@@ -33,30 +33,12 @@ data:
               "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]}
             }
           },
-          "gridPos": {"h": 5, "w": 4, "x": 0, "y": 1},
+          "gridPos": {"h": 6, "w": 3, "x": 0, "y": 1},
           "id": 1,
           "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
           "pluginVersion": "9.0.0",
-          "targets": [{"expr": "min(up{job=\"taiji\"})", "refId": "A"}],
+          "targets": [{"expr": "min(up{job=\"taiji\",environment=~\"$environment\"})", "refId": "A"}],
           "title": "Status",
-          "type": "stat"
-        },
-        {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "thresholds"},
-              "mappings": [],
-              "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
-              "unit": "short"
-            }
-          },
-          "gridPos": {"h": 5, "w": 4, "x": 4, "y": 1},
-          "id": 2,
-          "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
-          "pluginVersion": "9.0.0",
-          "targets": [{"expr": "max(proxy_rules_total)", "refId": "A"}],
-          "title": "Total Backends",
           "type": "stat"
         },
         {
@@ -66,16 +48,35 @@ data:
               "color": {"mode": "thresholds"},
               "decimals": 2,
               "mappings": [],
-              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 50}, {"color": "orange", "value": 100}]},
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 50}, {"color": "orange", "value": 100}, {"color": "red", "value": 200}]},
               "unit": "reqps"
             }
           },
-          "gridPos": {"h": 5, "w": 4, "x": 8, "y": 1},
+          "gridPos": {"h": 6, "w": 3, "x": 3, "y": 1},
+          "id": 2,
+          "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
+          "pluginVersion": "9.0.0",
+          "targets": [{"expr": "sum(rate(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "refId": "A"}],
+          "title": "Request Rate",
+          "type": "stat"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "decimals": 0,
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
+              "unit": "short"
+            }
+          },
+          "gridPos": {"h": 6, "w": 3, "x": 6, "y": 1},
           "id": 3,
           "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
           "pluginVersion": "9.0.0",
-          "targets": [{"expr": "sum(rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "refId": "A"}],
-          "title": "Request Rate",
+          "targets": [{"expr": "sum(increase(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[24h]))", "refId": "A"}],
+          "title": "24h Total Requests",
           "type": "stat"
         },
         {
@@ -89,12 +90,50 @@ data:
               "unit": "s"
             }
           },
-          "gridPos": {"h": 5, "w": 4, "x": 12, "y": 1},
+          "gridPos": {"h": 6, "w": 3, "x": 9, "y": 1},
           "id": 4,
           "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
           "pluginVersion": "9.0.0",
-          "targets": [{"expr": "histogram_quantile(0.99, sum(rate(proxy_request_duration_seconds_bucket{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])) by (le))", "refId": "A"}],
-          "title": "P99 Latency",
+          "targets": [{"expr": "histogram_quantile(0.95, sum(rate(proxy_request_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])) by (le))", "refId": "A"}],
+          "title": "P95 Total Latency",
+          "type": "stat"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "decimals": 3,
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.002}, {"color": "orange", "value": 0.005}, {"color": "red", "value": 0.01}]},
+              "unit": "s"
+            }
+          },
+          "gridPos": {"h": 6, "w": 3, "x": 12, "y": 1},
+          "id": 5,
+          "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
+          "pluginVersion": "9.0.0",
+          "targets": [{"expr": "histogram_quantile(0.95, sum(rate(proxy_overhead_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])) by (le))", "refId": "A"}],
+          "title": "P95 Proxy Overhead",
+          "type": "stat"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "decimals": 3,
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.01}, {"color": "orange", "value": 0.05}, {"color": "red", "value": 0.1}]},
+              "unit": "s"
+            }
+          },
+          "gridPos": {"h": 6, "w": 3, "x": 15, "y": 1},
+          "id": 6,
+          "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
+          "pluginVersion": "9.0.0",
+          "targets": [{"expr": "histogram_quantile(0.95, sum(rate(proxy_backend_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])) by (le))", "refId": "A"}],
+          "title": "P95 Backend Latency",
           "type": "stat"
         },
         {
@@ -110,204 +149,12 @@ data:
               "unit": "percentunit"
             }
           },
-          "gridPos": {"h": 5, "w": 4, "x": 16, "y": 1},
-          "id": 5,
+          "gridPos": {"h": 6, "w": 3, "x": 18, "y": 1},
+          "id": 7,
           "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
           "pluginVersion": "9.0.0",
-          "targets": [{"expr": "sum(rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"4..|5..\"}[5m])) / sum(rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "refId": "A"}],
+          "targets": [{"expr": "sum(rate(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"4..|5..\"}[5m])) / sum(rate(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "refId": "A"}],
           "title": "Error Rate",
-          "type": "stat"
-        },
-        {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "thresholds"},
-              "decimals": 0,
-              "mappings": [],
-              "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
-              "unit": "short"
-            }
-          },
-          "gridPos": {"h": 5, "w": 4, "x": 20, "y": 1},
-          "id": 6,
-          "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
-          "pluginVersion": "9.0.0",
-          "targets": [{"expr": "sum(increase(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[24h]))", "refId": "A"}],
-          "title": "24h Requests",
-          "type": "stat"
-        },
-        {
-          "collapsed": false,
-          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 6},
-          "id": 101,
-          "panels": [],
-          "title": "Traffic & Performance",
-          "type": "row"
-        },
-        {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "palette-classic"},
-              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
-              "mappings": [],
-              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
-              "unit": "reqps"
-            }
-          },
-          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 7},
-          "id": 10,
-          "options": {"legend": {"calcs": ["mean", "max", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-          "targets": [{"expr": "sum by (subdomain) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m]))", "legendFormat": "{{subdomain}}", "refId": "A"}],
-          "title": "Request Rate by Subdomain",
-          "type": "timeseries"
-        },
-        {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "palette-classic"},
-              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
-              "mappings": [],
-              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
-              "unit": "reqps"
-            }
-          },
-          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 7},
-          "id": 30,
-          "options": {"legend": {"calcs": ["mean", "max", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-          "targets": [{"expr": "sum by (subdomain, backend) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m]))", "legendFormat": "{{subdomain}} - {{backend}}", "refId": "A"}],
-          "title": "Request Rate by Backend",
-          "type": "timeseries"
-        },
-        {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "palette-classic"},
-              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
-              "mappings": [],
-              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
-              "unit": "s"
-            }
-          },
-          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 15},
-          "id": 11,
-          "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-          "targets": [
-            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])))", "legendFormat": "{{subdomain}} - p99", "refId": "A"},
-            {"expr": "histogram_quantile(0.95, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])))", "legendFormat": "{{subdomain}} - p95", "refId": "B"},
-            {"expr": "histogram_quantile(0.50, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])))", "legendFormat": "{{subdomain}} - p50", "refId": "C"}
-          ],
-          "title": "Latency Percentiles by Subdomain",
-          "type": "timeseries"
-        },
-        {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "palette-classic"},
-              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
-              "mappings": [],
-              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
-              "unit": "s"
-            }
-          },
-          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 15},
-          "id": 31,
-          "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-          "targets": [
-            {"expr": "histogram_quantile(0.99, sum by (subdomain, backend, le) (rate(proxy_request_duration_seconds_bucket{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])))", "legendFormat": "{{subdomain}}/{{backend}} - p99", "refId": "A"}
-          ],
-          "title": "P99 Latency by Backend",
-          "type": "timeseries"
-        },
-        {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "thresholds"},
-              "custom": {"align": "left", "displayMode": "auto", "filterable": true},
-              "mappings": [],
-              "thresholds": {"mode": "absolute", "steps": [{"color": "text", "value": null}]},
-              "unit": "short"
-            },
-            "overrides": [
-              {"matcher": {"id": "byName", "options": "Requests/sec"}, "properties": [{"id": "custom.displayMode", "value": "gradient-gauge"}, {"id": "decimals", "value": 2}, {"id": "custom.width", "value": 150}]},
-              {"matcher": {"id": "byName", "options": "Backend"}, "properties": [{"id": "custom.width", "value": 300}]}
-            ]
-          },
-          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 23},
-          "id": 12,
-          "options": {"footer": {"fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": true, "displayName": "Requests/sec"}]},
-          "targets": [{"expr": "sum by (subdomain, backend) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "format": "table", "instant": true, "refId": "A"}],
-          "title": "Backend Traffic Ranking",
-          "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true}, "indexByName": {}, "renameByName": {"Value": "Requests/sec", "backend": "Backend", "subdomain": "Subdomain"}}}],
-          "type": "table"
-        },
-        {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "palette-classic"},
-              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "normal"}, "thresholdsStyle": {"mode": "off"}},
-              "mappings": [],
-              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
-              "unit": "reqps"
-            }
-          },
-          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 23},
-          "id": 13,
-          "options": {"legend": {"calcs": ["mean", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-          "targets": [{"expr": "sum by (status_code) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "legendFormat": "{{status_code}}", "refId": "A"}],
-          "title": "Status Codes",
-          "type": "timeseries"
-        },
-        {
-          "collapsed": false,
-          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 31},
-          "id": 104,
-          "panels": [],
-          "title": "Latency Breakdown (Backend vs Proxy Overhead)",
-          "type": "row"
-        },
-        {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "thresholds"},
-              "decimals": 3,
-              "mappings": [],
-              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.002}, {"color": "orange", "value": 0.005}, {"color": "red", "value": 0.01}]},
-              "unit": "s"
-            }
-          },
-          "gridPos": {"h": 5, "w": 6, "x": 0, "y": 32},
-          "id": 40,
-          "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
-          "pluginVersion": "9.0.0",
-          "targets": [{"expr": "histogram_quantile(0.95, sum(rate(proxy_overhead_duration_seconds_bucket{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])) by (le))", "refId": "A"}],
-          "title": "P95 Proxy Overhead",
-          "type": "stat"
-        },
-        {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "thresholds"},
-              "decimals": 3,
-              "mappings": [],
-              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.01}, {"color": "orange", "value": 0.05}, {"color": "red", "value": 0.1}]},
-              "unit": "s"
-            }
-          },
-          "gridPos": {"h": 5, "w": 6, "x": 6, "y": 32},
-          "id": 41,
-          "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
-          "pluginVersion": "9.0.0",
-          "targets": [{"expr": "histogram_quantile(0.95, sum(rate(proxy_backend_duration_seconds_bucket{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])) by (le))", "refId": "A"}],
-          "title": "P95 Backend Latency",
           "type": "stat"
         },
         {
@@ -323,59 +170,223 @@ data:
               "unit": "percent"
             }
           },
-          "gridPos": {"h": 5, "w": 6, "x": 12, "y": 32},
-          "id": 42,
+          "gridPos": {"h": 6, "w": 3, "x": 21, "y": 1},
+          "id": 8,
           "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
           "pluginVersion": "9.0.0",
-          "targets": [{"expr": "100 * (sum(rate(proxy_overhead_duration_seconds_sum{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])) / sum(rate(proxy_request_duration_seconds_sum{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])))", "refId": "A"}],
+          "targets": [{"expr": "100 * (sum(rate(proxy_overhead_duration_seconds_sum{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])) / sum(rate(proxy_request_duration_seconds_sum{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "refId": "A"}],
           "title": "Proxy Overhead %",
           "type": "stat"
         },
         {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "thresholds"},
-              "decimals": 3,
-              "mappings": [],
-              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.01}, {"color": "orange", "value": 0.05}, {"color": "red", "value": 0.1}]},
-              "unit": "s"
-            }
-          },
-          "gridPos": {"h": 5, "w": 6, "x": 18, "y": 32},
-          "id": 43,
-          "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
-          "pluginVersion": "9.0.0",
-          "targets": [{"expr": "histogram_quantile(0.95, sum(rate(proxy_request_duration_seconds_bucket{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])) by (le))", "refId": "A"}],
-          "title": "P95 Total Latency",
-          "type": "stat"
+          "collapsed": false,
+          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 7},
+          "id": 101,
+          "panels": [],
+          "title": "📊 Traffic Overview",
+          "type": "row"
         },
         {
           "datasource": "Prometheus",
           "fieldConfig": {
             "defaults": {
               "color": {"mode": "palette-classic"},
-              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 0, "gradientMode": "none", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "reqps"
+            }
+          },
+          "gridPos": {"h": 8, "w": 16, "x": 0, "y": 8},
+          "id": 10,
+          "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"expr": "sum by (subdomain) (rate(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m]))", "legendFormat": "{{subdomain}}", "refId": "A"}],
+          "title": "Request Rate by Subdomain",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "custom": {"align": "left", "displayMode": "auto", "filterable": true},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "text", "value": null}]},
+              "unit": "short"
+            },
+            "overrides": [
+              {"matcher": {"id": "byName", "options": "Mean"}, "properties": [{"id": "custom.displayMode", "value": "gradient-gauge"}, {"id": "decimals", "value": 2}, {"id": "custom.width", "value": 100}]},
+              {"matcher": {"id": "byName", "options": "P90"}, "properties": [{"id": "custom.displayMode", "value": "gradient-gauge"}, {"id": "decimals", "value": 2}, {"id": "custom.width", "value": 100}]},
+              {"matcher": {"id": "byName", "options": "Subdomain"}, "properties": [{"id": "custom.width", "value": 200}]}
+            ]
+          },
+          "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8},
+          "id": 11,
+          "options": {"footer": {"fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": true, "displayName": "Mean"}]},
+          "targets": [
+            {"expr": "sum by (subdomain) (rate(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m]))", "format": "table", "instant": true, "refId": "A"}
+          ],
+          "title": "Traffic Ranking (req/s)",
+          "transformations": [
+            {"id": "organize", "options": {"excludeByName": {"Time": true}, "indexByName": {}, "renameByName": {"Value": "Req/s", "subdomain": "Subdomain"}}}
+          ],
+          "type": "table"
+        },
+        {
+          "collapsed": false,
+          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 16},
+          "id": 102,
+          "panels": [],
+          "title": "⚡ P95 Latency Analysis",
+          "type": "row"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
               "mappings": [],
               "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
               "unit": "s"
+            }
+          },
+          "gridPos": {"h": 8, "w": 16, "x": 0, "y": 17},
+          "id": 20,
+          "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "histogram_quantile(0.95, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "legendFormat": "{{subdomain}}", "refId": "A"}
+          ],
+          "title": "P95 Total Latency by Subdomain",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "custom": {"align": "left", "displayMode": "auto", "filterable": true},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "text", "value": null}]},
+              "unit": "s"
             },
             "overrides": [
-              {"matcher": {"id": "byRegexp", "options": ".*Backend.*"}, "properties": [{"id": "color", "value": {"fixedColor": "blue", "mode": "fixed"}}]},
-              {"matcher": {"id": "byRegexp", "options": ".*Overhead.*"}, "properties": [{"id": "color", "value": {"fixedColor": "orange", "mode": "fixed"}}]},
-              {"matcher": {"id": "byRegexp", "options": ".*Total.*"}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]}
+              {"matcher": {"id": "byName", "options": "Mean"}, "properties": [{"id": "custom.displayMode", "value": "gradient-gauge"}, {"id": "decimals", "value": 3}, {"id": "custom.width", "value": 100}, {"id": "color", "value": {"mode": "continuous-GrYlRd"}}]},
+              {"matcher": {"id": "byName", "options": "P90"}, "properties": [{"id": "custom.displayMode", "value": "gradient-gauge"}, {"id": "decimals", "value": 3}, {"id": "custom.width", "value": 100}, {"id": "color", "value": {"mode": "continuous-GrYlRd"}}]},
+              {"matcher": {"id": "byName", "options": "Subdomain"}, "properties": [{"id": "custom.width", "value": 200}]}
             ]
           },
-          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 37},
-          "id": 44,
+          "gridPos": {"h": 8, "w": 8, "x": 16, "y": 17},
+          "id": 21,
+          "options": {"footer": {"fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": true, "displayName": "Mean"}]},
+          "targets": [
+            {"expr": "histogram_quantile(0.95, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "format": "table", "instant": true, "refId": "A"},
+            {"expr": "histogram_quantile(0.90, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "format": "table", "instant": true, "refId": "B"}
+          ],
+          "title": "P95 Latency Table (Mean + P90)",
+          "transformations": [
+            {"id": "merge", "options": {}},
+            {"id": "organize", "options": {"excludeByName": {"Time": true}, "indexByName": {}, "renameByName": {"Value #A": "Mean", "Value #B": "P90", "subdomain": "Subdomain"}}}
+          ],
+          "type": "table"
+        },
+        {
+          "collapsed": false,
+          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 25},
+          "id": 103,
+          "panels": [],
+          "title": "❌ Backend Health & Errors",
+          "type": "row"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "max": 1,
+              "min": 0,
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 0.05}]},
+              "unit": "percentunit"
+            }
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 26},
+          "id": 30,
+          "options": {"legend": {"calcs": ["mean", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"expr": "sum by (subdomain, backend) (rate(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"5..\"}[5m])) / sum by (subdomain, backend) (rate(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "legendFormat": "{{subdomain}}/{{backend}}", "refId": "A"}],
+          "title": "5xx Error Rate by Backend",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "reqps"
+            }
+          },
+          "gridPos": {"h": 8, "w": 6, "x": 12, "y": 26},
+          "id": 31,
+          "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"expr": "sum by (subdomain, backend) (rate(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=\"502\"}[5m]))", "legendFormat": "{{subdomain}}/{{backend}}", "refId": "A"}],
+          "title": "502 Errors (Backend Down)",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "normal"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "reqps"
+            }
+          },
+          "gridPos": {"h": 8, "w": 6, "x": 18, "y": 26},
+          "id": 32,
+          "options": {"legend": {"calcs": ["mean", "last"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"expr": "sum by (status_code) (rate(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "legendFormat": "{{status_code}}", "refId": "A"}],
+          "title": "Status Codes",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 5}]},
+              "unit": "s"
+            },
+            "overrides": [
+              {"matcher": {"id": "byRegexp", "options": ".*5.."}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]},
+              {"matcher": {"id": "byRegexp", "options": ".*429"}, "properties": [{"id": "color", "value": {"fixedColor": "orange", "mode": "fixed"}}]},
+              {"matcher": {"id": "byRegexp", "options": ".*502|504"}, "properties": [{"id": "color", "value": {"fixedColor": "purple", "mode": "fixed"}}]}
+            ]
+          },
+          "gridPos": {"h": 8, "w": 24, "x": 0, "y": 34},
+          "id": 33,
           "options": {"legend": {"calcs": ["mean", "max", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
           "targets": [
-            {"expr": "histogram_quantile(0.95, sum by (subdomain, le) (rate(proxy_backend_duration_seconds_bucket{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])))", "legendFormat": "{{subdomain}} - Backend p95", "refId": "A"},
-            {"expr": "histogram_quantile(0.95, sum by (subdomain, le) (rate(proxy_overhead_duration_seconds_bucket{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])))", "legendFormat": "{{subdomain}} - Overhead p95", "refId": "B"},
-            {"expr": "histogram_quantile(0.95, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])))", "legendFormat": "{{subdomain}} - Total p95", "refId": "C"}
+            {"expr": "histogram_quantile(0.95, sum by (status_code, le) (rate(proxy_request_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"4..|5..\"}[5m])))", "legendFormat": "{{status_code}} - Total", "refId": "A"},
+            {"expr": "histogram_quantile(0.95, sum by (status_code, le) (rate(proxy_overhead_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"4..|5..\"}[5m])))", "legendFormat": "{{status_code}} - Overhead", "refId": "B"}
           ],
-          "title": "P95 Latency Breakdown by Subdomain",
+          "title": "P95 Failure Latency by Status Code (4xx/5xx)",
           "type": "timeseries"
+        },
+        {
+          "collapsed": false,
+          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 42},
+          "id": 104,
+          "panels": [],
+          "title": "🔍 P95 Latency Breakdown (Proxy vs Backend)",
+          "type": "row"
         },
         {
           "datasource": "Prometheus",
@@ -392,36 +403,14 @@ data:
               {"matcher": {"id": "byRegexp", "options": ".*Overhead.*"}, "properties": [{"id": "color", "value": {"fixedColor": "orange", "mode": "fixed"}}]}
             ]
           },
-          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 37},
-          "id": 45,
-          "options": {"legend": {"calcs": ["mean", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "gridPos": {"h": 8, "w": 16, "x": 0, "y": 60},
+          "id": 40,
+          "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
           "targets": [
-            {"expr": "sum by (subdomain) (rate(proxy_backend_duration_seconds_sum{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])) / sum by (subdomain) (rate(proxy_backend_duration_seconds_count{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "legendFormat": "{{subdomain}} - Backend", "refId": "A"},
-            {"expr": "sum by (subdomain) (rate(proxy_overhead_duration_seconds_sum{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])) / sum by (subdomain) (rate(proxy_overhead_duration_seconds_count{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "legendFormat": "{{subdomain}} - Overhead", "refId": "B"}
+            {"expr": "sum by (subdomain) (rate(proxy_backend_duration_seconds_sum{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])) / sum by (subdomain) (rate(proxy_backend_duration_seconds_count{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m]))", "legendFormat": "{{subdomain}} - Backend", "refId": "A"},
+            {"expr": "sum by (subdomain) (rate(proxy_overhead_duration_seconds_sum{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])) / sum by (subdomain) (rate(proxy_overhead_duration_seconds_count{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m]))", "legendFormat": "{{subdomain}} - Overhead", "refId": "B"}
           ],
-          "title": "Average Latency Components (Stacked)",
-          "type": "timeseries"
-        },
-        {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "palette-classic"},
-              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
-              "mappings": [],
-              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
-              "unit": "s"
-            }
-          },
-          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 45},
-          "id": 46,
-          "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-          "targets": [
-            {"expr": "histogram_quantile(0.99, sum by (subdomain, backend, le) (rate(proxy_overhead_duration_seconds_bucket{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])))", "legendFormat": "{{subdomain}}/{{backend}} - p99", "refId": "A"},
-            {"expr": "histogram_quantile(0.95, sum by (subdomain, backend, le) (rate(proxy_overhead_duration_seconds_bucket{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])))", "legendFormat": "{{subdomain}}/{{backend}} - p95", "refId": "B"},
-            {"expr": "histogram_quantile(0.50, sum by (subdomain, backend, le) (rate(proxy_overhead_duration_seconds_bucket{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])))", "legendFormat": "{{subdomain}}/{{backend}} - p50", "refId": "C"}
-          ],
-          "title": "Proxy Overhead Percentiles by Backend",
+          "title": "Latency Components: Backend vs Proxy Overhead (Stacked)",
           "type": "timeseries"
         },
         {
@@ -440,217 +429,27 @@ data:
               {"matcher": {"id": "byName", "options": "Overhead %"}, "properties": [{"id": "custom.displayMode", "value": "gradient-gauge"}, {"id": "decimals", "value": 1}, {"id": "custom.width", "value": 100}, {"id": "color", "value": {"mode": "continuous-GrYlRd"}}, {"id": "unit", "value": "percent"}]}
             ]
           },
-          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 45},
-          "id": 47,
+          "gridPos": {"h": 8, "w": 8, "x": 16, "y": 60},
+          "id": 41,
           "options": {"footer": {"fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": true, "displayName": "Overhead (ms)"}]},
           "targets": [
-            {"expr": "1000 * (sum by (subdomain, backend) (rate(proxy_overhead_duration_seconds_sum{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])) / sum by (subdomain, backend) (rate(proxy_overhead_duration_seconds_count{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])))", "format": "table", "instant": true, "refId": "A"},
-            {"expr": "1000 * (sum by (subdomain, backend) (rate(proxy_backend_duration_seconds_sum{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])) / sum by (subdomain, backend) (rate(proxy_backend_duration_seconds_count{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])))", "format": "table", "instant": true, "refId": "B"},
-            {"expr": "100 * (sum by (subdomain, backend) (rate(proxy_overhead_duration_seconds_sum{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])) / sum by (subdomain, backend) (rate(proxy_request_duration_seconds_sum{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])))", "format": "table", "instant": true, "refId": "C"}
+            {"expr": "1000 * (sum by (subdomain) (rate(proxy_overhead_duration_seconds_sum{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])) / sum by (subdomain) (rate(proxy_overhead_duration_seconds_count{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "format": "table", "instant": true, "refId": "A"},
+            {"expr": "1000 * (sum by (subdomain) (rate(proxy_backend_duration_seconds_sum{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])) / sum by (subdomain) (rate(proxy_backend_duration_seconds_count{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "format": "table", "instant": true, "refId": "B"},
+            {"expr": "100 * (sum by (subdomain) (rate(proxy_overhead_duration_seconds_sum{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])) / sum by (subdomain) (rate(proxy_request_duration_seconds_sum{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "format": "table", "instant": true, "refId": "C"}
           ],
           "title": "Latency Breakdown Table",
           "transformations": [
             {"id": "merge", "options": {}},
-            {"id": "organize", "options": {"excludeByName": {"Time": true}, "indexByName": {}, "renameByName": {"Value #A": "Overhead (ms)", "Value #B": "Backend (ms)", "Value #C": "Overhead %", "backend": "Backend", "subdomain": "Subdomain"}}}
+            {"id": "organize", "options": {"excludeByName": {"Time": true}, "indexByName": {}, "renameByName": {"Value #A": "Overhead (ms)", "Value #B": "Backend (ms)", "Value #C": "Overhead %", "subdomain": "Subdomain"}}}
           ],
           "type": "table"
         },
         {
           "collapsed": false,
-          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 53},
-          "id": 102,
+          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 68},
+          "id": 105,
           "panels": [],
-          "title": "Backend Health",
-          "type": "row"
-        },
-        {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "palette-classic"},
-              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
-              "mappings": [],
-              "max": 1,
-              "min": 0,
-              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 0.05}]},
-              "unit": "percentunit"
-            }
-          },
-          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
-          "id": 32,
-          "options": {"legend": {"calcs": ["mean", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-          "targets": [{"expr": "sum by (subdomain, backend) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"5..\"}[5m])) / sum by (subdomain, backend) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "legendFormat": "{{subdomain}}/{{backend}}", "refId": "A"}],
-          "title": "5xx Error Rate by Backend",
-          "type": "timeseries"
-        },
-        {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "palette-classic"},
-              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
-              "mappings": [],
-              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
-              "unit": "reqps"
-            }
-          },
-          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
-          "id": 33,
-          "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-          "targets": [{"expr": "sum by (subdomain, backend) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=\"502\"}[5m]))", "legendFormat": "{{subdomain}}/{{backend}}", "refId": "A"}],
-          "title": "502 Errors (Backend Down)",
-          "type": "timeseries"
-        },
-        {
-          "collapsed": false,
-          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 40},
-          "id": 103,
-          "panels": [],
-          "title": "Configuration",
-          "type": "row"
-        },
-        {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "palette-classic"},
-              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 100, "gradientMode": "none", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
-              "mappings": [{"options": {"0": {"color": "red", "text": "Inactive"}, "1": {"color": "green", "text": "Active"}}, "type": "value"}],
-              "max": 1,
-              "min": 0,
-              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
-              "unit": "short"
-            }
-          },
-          "gridPos": {"h": 7, "w": 12, "x": 0, "y": 41},
-          "id": 20,
-          "options": {"legend": {"calcs": ["last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
-          "targets": [{"expr": "max by (subdomain) (proxy_rule_active{subdomain=~\"$subdomain\"})", "legendFormat": "{{subdomain}}", "refId": "A"}],
-          "title": "Rule Status",
-          "type": "timeseries"
-        },
-        {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "palette-classic"},
-              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "stepAfter", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
-              "mappings": [],
-              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
-              "unit": "ops"
-            },
-            "overrides": [
-              {"matcher": {"id": "byName", "options": "Errors"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]},
-              {"matcher": {"id": "byName", "options": "Attempts"}, "properties": [{"id": "color", "value": {"fixedColor": "blue", "mode": "fixed"}}]}
-            ]
-          },
-          "gridPos": {"h": 7, "w": 12, "x": 12, "y": 41},
-          "id": 21,
-          "options": {"legend": {"calcs": ["sum", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
-          "targets": [{"expr": "rate(proxy_csv_reload_total[5m])", "legendFormat": "Attempts", "refId": "A"}, {"expr": "rate(proxy_csv_reload_errors_total[5m])", "legendFormat": "Errors", "refId": "B"}],
-          "title": "CSV Reloads",
-          "type": "timeseries"
-        },
-        {
-          "collapsed": false,
-          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 48},
-          "id": 400,
-          "panels": [],
-          "title": "Retry & Rate Limiting",
-          "type": "row"
-        },
-        {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "palette-classic"},
-              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "normal"}, "thresholdsStyle": {"mode": "off"}},
-              "mappings": [],
-              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
-              "unit": "reqps"
-            },
-            "overrides": [
-              {"matcher": {"id": "byName", "options": "success"}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]},
-              {"matcher": {"id": "byName", "options": "all_failed"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]}
-            ]
-          },
-          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 49},
-          "id": 401,
-          "options": {"legend": {"calcs": ["sum", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-          "targets": [
-            {"expr": "sum by (subdomain, outcome) (rate(proxy_retry_attempts_total{subdomain=~\"$subdomain\"}[5m]))", "legendFormat": "{{subdomain}}: {{outcome}}", "refId": "A"}
-          ],
-          "title": "Retry Rate by Subdomain",
-          "type": "timeseries"
-        },
-        {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "palette-classic"},
-              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
-              "mappings": [],
-              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.5}, {"color": "red", "value": 1}]},
-              "unit": "reqps"
-            }
-          },
-          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 49},
-          "id": 402,
-          "options": {"legend": {"calcs": ["sum", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-          "targets": [
-            {"expr": "sum by (subdomain, backend) (rate(proxy_backend_failures_total{subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "legendFormat": "{{subdomain}}/{{backend}}", "refId": "A"}
-          ],
-          "title": "Backend Failure Rate (Triggers Retries)",
-          "type": "timeseries"
-        },
-        {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "palette-classic"},
-              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
-              "mappings": [],
-              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 0.1}, {"color": "red", "value": 0.5}]},
-              "unit": "reqps"
-            }
-          },
-          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 57},
-          "id": 403,
-          "options": {"legend": {"calcs": ["sum", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-          "targets": [
-            {"expr": "sum by (subdomain, backend) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=\"429\"}[5m]))", "legendFormat": "{{subdomain}}/{{backend}}", "refId": "A"}
-          ],
-          "title": "Rate Limit Errors (429) by Backend",
-          "type": "timeseries"
-        },
-        {
-          "datasource": "Prometheus",
-          "fieldConfig": {
-            "defaults": {
-              "color": {"mode": "thresholds"},
-              "mappings": [],
-              "max": 1,
-              "min": 0,
-              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.1}, {"color": "orange", "value": 0.5}, {"color": "red", "value": 0.8}]},
-              "unit": "percentunit"
-            }
-          },
-          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 57},
-          "id": 404,
-          "options": {"displayMode": "gradient", "minVizHeight": 10, "minVizWidth": 0, "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "showUnfilled": true},
-          "pluginVersion": "9.0.0",
-          "targets": [
-            {"expr": "sum by (subdomain, backend) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=\"429\"}[10m])) / sum by (subdomain, backend) (rate(proxy_requests_total{subdomain=~\"$subdomain\",backend=~\"$backend\"}[10m]))", "legendFormat": "{{subdomain}}/{{backend}}", "refId": "A"}
-          ],
-          "title": "Rate Limit Error Percentage by Backend",
-          "type": "bargauge"
-        },
-        {
-          "collapsed": false,
-          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 65},
-          "id": 500,
-          "panels": [],
-          "title": "Distributed Rate Limiting (Redis)",
+          "title": "🚦 Rate Limiting",
           "type": "row"
         },
         {
@@ -670,8 +469,8 @@ data:
               "unit": "percentunit"
             }
           },
-          "gridPos": {"h": 5, "w": 4, "x": 0, "y": 66},
-          "id": 501,
+          "gridPos": {"h": 6, "w": 4, "x": 0, "y": 52},
+          "id": 50,
           "options": {
             "colorMode": "background",
             "graphMode": "area",
@@ -680,7 +479,7 @@ data:
             "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
             "textMode": "value"
           },
-          "targets": [{"expr": "sum(rate(proxy_ratelimit_requests_total{job=\"taiji\",action=\"blocked\"}[5m])) / sum(rate(proxy_ratelimit_requests_total{job=\"taiji\"}[5m]))", "legendFormat": "Block Rate", "refId": "A"}],
+          "targets": [{"expr": "sum(rate(proxy_ratelimit_requests_total{job=\"taiji\",environment=~\"$environment\",action=\"blocked\"}[5m])) / sum(rate(proxy_ratelimit_requests_total{job=\"taiji\",environment=~\"$environment\"}[5m]))", "legendFormat": "Block Rate", "refId": "A"}],
           "title": "Block Rate",
           "type": "stat"
         },
@@ -688,31 +487,81 @@ data:
           "datasource": "Prometheus",
           "fieldConfig": {
             "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "reqps"
+            },
+            "overrides": [
+              {"matcher": {"id": "byRegexp", "options": ".*Allowed"}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]},
+              {"matcher": {"id": "byRegexp", "options": ".*Blocked"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]}
+            ]
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 4, "y": 52},
+          "id": 51,
+          "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "sum by (subdomain) (rate(proxy_ratelimit_requests_total{job=\"taiji\",environment=~\"$environment\",subdomain=~\"$subdomain\",action=\"allowed\"}[5m]))", "legendFormat": "{{subdomain}} - Allowed", "refId": "A"},
+            {"expr": "sum by (subdomain) (rate(proxy_ratelimit_requests_total{job=\"taiji\",environment=~\"$environment\",subdomain=~\"$subdomain\",action=\"blocked\"}[5m]))", "legendFormat": "{{subdomain}} - Blocked", "refId": "B"}
+          ],
+          "title": "Rate Limit: Allowed vs Blocked",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
               "color": {"mode": "thresholds"},
+              "custom": {"align": "left", "displayMode": "auto", "filterable": true},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "text", "value": null}]},
+              "unit": "short"
+            },
+            "overrides": [
+              {"matcher": {"id": "byName", "options": "Mean"}, "properties": [{"id": "custom.displayMode", "value": "gradient-gauge"}, {"id": "decimals", "value": 2}, {"id": "custom.width", "value": 100}, {"id": "color", "value": {"mode": "continuous-RdYlGr"}}]},
+              {"matcher": {"id": "byName", "options": "P90"}, "properties": [{"id": "custom.displayMode", "value": "gradient-gauge"}, {"id": "decimals", "value": 2}, {"id": "custom.width", "value": 100}, {"id": "color", "value": {"mode": "continuous-RdYlGr"}}]},
+              {"matcher": {"id": "byName", "options": "Subdomain"}, "properties": [{"id": "custom.width", "value": 200}]}
+            ]
+          },
+          "gridPos": {"h": 8, "w": 8, "x": 16, "y": 52},
+          "id": 52,
+          "options": {"footer": {"fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": true, "displayName": "Mean"}]},
+          "targets": [{"expr": "topk(20, sum by (subdomain) (rate(proxy_ratelimit_requests_total{job=\"taiji\",environment=~\"$environment\",action=\"blocked\"}[5m])))", "format": "table", "instant": true, "refId": "A"}],
+          "title": "Top Rate Limited Subdomains",
+          "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true}, "indexByName": {}, "renameByName": {"Value": "Blocked/sec", "subdomain": "Subdomain"}}}],
+          "type": "table"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "decimals": 1,
               "mappings": [],
               "thresholds": {
                 "mode": "absolute",
                 "steps": [
                   {"color": "green", "value": null},
-                  {"color": "yellow", "value": 1},
-                  {"color": "red", "value": 10}
+                  {"color": "yellow", "value": 0.005},
+                  {"color": "red", "value": 0.01}
                 ]
               },
-              "unit": "reqps"
+              "unit": "s"
             }
           },
-          "gridPos": {"h": 5, "w": 4, "x": 4, "y": 66},
-          "id": 502,
+          "gridPos": {"h": 6, "w": 4, "x": 0, "y": 58},
+          "id": 53,
           "options": {
-            "colorMode": "background",
+            "colorMode": "value",
             "graphMode": "area",
-            "justifyMode": "auto",
+            "justifyMode": "center",
             "orientation": "auto",
-            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
-            "textMode": "value_and_name"
+            "reduceOptions": {"calcs": ["mean"], "fields": "", "values": false},
+            "textMode": "value"
           },
-          "targets": [{"expr": "rate(proxy_ratelimit_redis_errors_total{job=\"taiji\"}[5m])", "legendFormat": "Redis Errors/sec", "refId": "A"}],
-          "title": "Redis Errors",
+          "targets": [{"expr": "sum(rate(proxy_ratelimit_check_duration_seconds_sum{job=\"taiji\",environment=~\"$environment\"}[5m])) / sum(rate(proxy_ratelimit_check_duration_seconds_count{job=\"taiji\",environment=~\"$environment\"}[5m]))", "legendFormat": "Avg Latency", "refId": "A"}],
+          "title": "Redis Avg Latency",
           "type": "stat"
         },
         {
@@ -733,8 +582,8 @@ data:
               "unit": "s"
             }
           },
-          "gridPos": {"h": 5, "w": 4, "x": 8, "y": 66},
-          "id": 506,
+          "gridPos": {"h": 6, "w": 4, "x": 4, "y": 58},
+          "id": 54,
           "options": {
             "colorMode": "value",
             "graphMode": "area",
@@ -743,34 +592,40 @@ data:
             "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
             "textMode": "value"
           },
-          "targets": [{"expr": "histogram_quantile(0.90, sum(rate(proxy_ratelimit_check_duration_seconds_bucket{job=\"taiji\"}[5m])) by (le))", "legendFormat": "P90 Latency", "refId": "A"}],
-          "title": "Redis P90 Latency",
+          "targets": [{"expr": "histogram_quantile(0.95, sum(rate(proxy_ratelimit_check_duration_seconds_bucket{job=\"taiji\",environment=~\"$environment\"}[5m])) by (le))", "legendFormat": "P95 Latency", "refId": "A"}],
+          "title": "Redis P95 Latency",
           "type": "stat"
         },
         {
           "datasource": "Prometheus",
           "fieldConfig": {
             "defaults": {
-              "color": {"mode": "palette-classic"},
-              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "color": {"mode": "thresholds"},
               "mappings": [],
-              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {"color": "green", "value": null},
+                  {"color": "yellow", "value": 1},
+                  {"color": "red", "value": 10}
+                ]
+              },
               "unit": "reqps"
-            },
-            "overrides": [
-              {"matcher": {"id": "byRegexp", "options": ".*Allowed"}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]},
-              {"matcher": {"id": "byRegexp", "options": ".*Blocked"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]}
-            ]
+            }
           },
-          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 66},
-          "id": 503,
-          "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-          "targets": [
-            {"expr": "sum by (subdomain) (rate(proxy_ratelimit_requests_total{job=\"taiji\",subdomain=~\"$subdomain\",action=\"allowed\"}[5m]))", "legendFormat": "{{subdomain}} - Allowed", "refId": "A"},
-            {"expr": "sum by (subdomain) (rate(proxy_ratelimit_requests_total{job=\"taiji\",subdomain=~\"$subdomain\",action=\"blocked\"}[5m]))", "legendFormat": "{{subdomain}} - Blocked", "refId": "B"}
-          ],
-          "title": "Rate Limit: Allowed vs Blocked",
-          "type": "timeseries"
+          "gridPos": {"h": 6, "w": 4, "x": 8, "y": 58},
+          "id": 55,
+          "options": {
+            "colorMode": "background",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "auto",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "value_and_name"
+          },
+          "targets": [{"expr": "rate(proxy_ratelimit_redis_errors_total{job=\"taiji\",environment=~\"$environment\"}[5m])", "legendFormat": "Redis Errors/sec", "refId": "A"}],
+          "title": "Redis Errors",
+          "type": "stat"
         },
         {
           "datasource": "Prometheus",
@@ -783,15 +638,83 @@ data:
               "unit": "s"
             }
           },
-          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 71},
-          "id": 504,
-          "options": {"legend": {"calcs": ["mean", "max", "last"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "single", "sort": "none"}},
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 58},
+          "id": 56,
+          "options": {"legend": {"calcs": ["mean", "max", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "single", "sort": "none"}},
           "targets": [
-            {"expr": "histogram_quantile(0.99, sum(rate(proxy_ratelimit_check_duration_seconds_bucket{job=\"taiji\"}[5m])) by (le))", "legendFormat": "P99", "refId": "A"},
-            {"expr": "histogram_quantile(0.95, sum(rate(proxy_ratelimit_check_duration_seconds_bucket{job=\"taiji\"}[5m])) by (le))", "legendFormat": "P95", "refId": "B"},
-            {"expr": "histogram_quantile(0.50, sum(rate(proxy_ratelimit_check_duration_seconds_bucket{job=\"taiji\"}[5m])) by (le))", "legendFormat": "P50", "refId": "C"}
+            {"expr": "histogram_quantile(0.99, sum(rate(proxy_ratelimit_check_duration_seconds_bucket{job=\"taiji\",environment=~\"$environment\"}[5m])) by (le))", "legendFormat": "P99", "refId": "A"},
+            {"expr": "histogram_quantile(0.95, sum(rate(proxy_ratelimit_check_duration_seconds_bucket{job=\"taiji\",environment=~\"$environment\"}[5m])) by (le))", "legendFormat": "P95", "refId": "B"},
+            {"expr": "histogram_quantile(0.50, sum(rate(proxy_ratelimit_check_duration_seconds_bucket{job=\"taiji\",environment=~\"$environment\"}[5m])) by (le))", "legendFormat": "P50", "refId": "C"}
           ],
-          "title": "Rate Limit Check Latency (Redis)",
+          "title": "Redis Rate Limit Check Latency (P50/P95/P99)",
+          "type": "timeseries"
+        },
+        {
+          "collapsed": false,
+          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 66},
+          "id": 106,
+          "panels": [],
+          "title": "🐛 P99 Debugging Section (Tail Latency Investigation)",
+          "type": "row"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "s"
+            }
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 67},
+          "id": 60,
+          "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "legendFormat": "{{subdomain}}", "refId": "A"}
+          ],
+          "title": "P99 Total Latency by Subdomain",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "s"
+            }
+          },
+          "gridPos": {"h": 8, "w": 6, "x": 12, "y": 67},
+          "id": 61,
+          "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_overhead_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "legendFormat": "{{subdomain}}", "refId": "A"}
+          ],
+          "title": "P99 Proxy Overhead",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "s"
+            }
+          },
+          "gridPos": {"h": 8, "w": 6, "x": 18, "y": 67},
+          "id": 62,
+          "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_backend_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "legendFormat": "{{subdomain}}", "refId": "A"}
+          ],
+          "title": "P99 Backend Latency",
           "type": "timeseries"
         },
         {
@@ -802,28 +725,273 @@ data:
               "custom": {"align": "left", "displayMode": "auto", "filterable": true},
               "mappings": [],
               "thresholds": {"mode": "absolute", "steps": [{"color": "text", "value": null}]},
+              "unit": "s"
+            },
+            "overrides": [
+              {"matcher": {"id": "byName", "options": "P99 Total"}, "properties": [{"id": "custom.displayMode", "value": "gradient-gauge"}, {"id": "decimals", "value": 3}, {"id": "custom.width", "value": 120}, {"id": "color", "value": {"mode": "continuous-GrYlRd"}}]},
+              {"matcher": {"id": "byName", "options": "P99 Overhead"}, "properties": [{"id": "custom.displayMode", "value": "gradient-gauge"}, {"id": "decimals", "value": 3}, {"id": "custom.width", "value": 120}]},
+              {"matcher": {"id": "byName", "options": "P99 Backend"}, "properties": [{"id": "custom.displayMode", "value": "gradient-gauge"}, {"id": "decimals", "value": 3}, {"id": "custom.width", "value": 120}]},
+              {"matcher": {"id": "byName", "options": "Max"}, "properties": [{"id": "custom.displayMode", "value": "color-text"}, {"id": "decimals", "value": 3}, {"id": "custom.width", "value": 120}, {"id": "color", "value": {"mode": "continuous-GrYlRd"}}]}
+            ]
+          },
+          "gridPos": {"h": 8, "w": 24, "x": 0, "y": 75},
+          "id": 63,
+          "options": {"footer": {"fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": true, "displayName": "P99 Total"}]},
+          "targets": [
+            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "format": "table", "instant": true, "refId": "A"},
+            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_overhead_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "format": "table", "instant": true, "refId": "B"},
+            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_backend_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "format": "table", "instant": true, "refId": "C"},
+            {"expr": "histogram_quantile(1.0, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "format": "table", "instant": true, "refId": "D"}
+          ],
+          "title": "P99 Breakdown Table (with Max)",
+          "transformations": [
+            {"id": "merge", "options": {}},
+            {"id": "organize", "options": {"excludeByName": {"Time": true}, "indexByName": {}, "renameByName": {"Value #A": "P99 Total", "Value #B": "P99 Overhead", "Value #C": "P99 Backend", "Value #D": "Max", "subdomain": "Subdomain"}}}
+          ],
+          "type": "table"
+        },
+        {
+          "collapsed": false,
+          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 83},
+          "id": 107,
+          "panels": [],
+          "title": "🔄 Retry & Advanced Metrics",
+          "type": "row"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "normal"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "reqps"
+            },
+            "overrides": [
+              {"matcher": {"id": "byName", "options": "success"}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]},
+              {"matcher": {"id": "byName", "options": "all_failed"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]}
+            ]
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 84},
+          "id": 70,
+          "options": {"legend": {"calcs": ["sum", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "sum by (subdomain, outcome) (rate(proxy_retry_attempts_total{environment=~\"$environment\",subdomain=~\"$subdomain\"}[5m]))", "legendFormat": "{{subdomain}}: {{outcome}}", "refId": "A"}
+          ],
+          "title": "Retry Rate by Subdomain",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "linear", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.5}, {"color": "red", "value": 1}]},
+              "unit": "reqps"
+            }
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 84},
+          "id": 71,
+          "options": {"legend": {"calcs": ["sum", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "sum by (subdomain, backend) (rate(proxy_backend_failures_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "legendFormat": "{{subdomain}}/{{backend}}", "refId": "A"}
+          ],
+          "title": "Backend Failure Rate (Triggers Retries)",
+          "type": "timeseries"
+        },
+        {
+          "collapsed": false,
+          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 92},
+          "id": 108,
+          "panels": [],
+          "title": "⚙️ Configuration & System Info",
+          "type": "row"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
+              "unit": "short"
+            }
+          },
+          "gridPos": {"h": 5, "w": 4, "x": 0, "y": 93},
+          "id": 80,
+          "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
+          "pluginVersion": "9.0.0",
+          "targets": [{"expr": "max(proxy_rules_total)", "refId": "A"}],
+          "title": "Total Backends",
+          "type": "stat"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "bars", "fillOpacity": 100, "gradientMode": "none", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [{"options": {"0": {"color": "red", "text": "Inactive"}, "1": {"color": "green", "text": "Active"}}, "type": "value"}],
+              "max": 1,
+              "min": 0,
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "short"
+            }
+          },
+          "gridPos": {"h": 7, "w": 10, "x": 4, "y": 93},
+          "id": 81,
+          "options": {"legend": {"calcs": ["last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+          "targets": [{"expr": "max by (subdomain) (proxy_rule_active{environment=~\"$environment\",subdomain=~\"$subdomain\"})", "legendFormat": "{{subdomain}}", "refId": "A"}],
+          "title": "Rule Status (Active/Inactive)",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "stepAfter", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "ops"
+            },
+            "overrides": [
+              {"matcher": {"id": "byName", "options": "Errors"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]},
+              {"matcher": {"id": "byName", "options": "Attempts"}, "properties": [{"id": "color", "value": {"fixedColor": "blue", "mode": "fixed"}}]}
+            ]
+          },
+          "gridPos": {"h": 7, "w": 10, "x": 14, "y": 93},
+          "id": 82,
+          "options": {"legend": {"calcs": ["sum", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+          "targets": [{"expr": "rate(proxy_csv_reload_total[5m])", "legendFormat": "Attempts", "refId": "A"}, {"expr": "rate(proxy_csv_reload_errors_total[5m])", "legendFormat": "Errors", "refId": "B"}],
+          "title": "CSV Reloads",
+          "type": "timeseries"
+        },
+        {
+          "collapsed": false,
+          "gridPos": {"h": 1, "w": 24, "x": 0, "y": 100},
+          "id": 109,
+          "panels": [],
+          "title": "💚 Health Checks & Fallbacks",
+          "type": "row"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "custom": {"align": "left", "displayMode": "auto", "filterable": true},
+              "mappings": [{"options": {"0": {"color": "red", "text": "DOWN"}, "1": {"color": "green", "text": "UP"}}, "type": "value"}],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]},
               "unit": "short"
             },
             "overrides": [
-              {"matcher": {"id": "byName", "options": "Blocked/sec"}, "properties": [{"id": "custom.displayMode", "value": "gradient-gauge"}, {"id": "decimals", "value": 2}, {"id": "custom.width", "value": 150}, {"id": "color", "value": {"mode": "continuous-RdYlGr"}}]},
-              {"matcher": {"id": "byName", "options": "Subdomain"}, "properties": [{"id": "custom.width", "value": 300}]}
+              {"matcher": {"id": "byName", "options": "Status"}, "properties": [{"id": "custom.displayMode", "value": "color-background"}, {"id": "custom.width", "value": 100}]},
+              {"matcher": {"id": "byName", "options": "Subdomain"}, "properties": [{"id": "custom.width", "value": 200}]},
+              {"matcher": {"id": "byName", "options": "Backend"}, "properties": [{"id": "custom.width", "value": 300}]}
             ]
           },
-          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 71},
-          "id": 505,
-          "options": {"footer": {"fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": true, "displayName": "Blocked/sec"}]},
-          "targets": [{"expr": "topk(10, sum by (subdomain) (rate(proxy_ratelimit_requests_total{job=\"taiji\",action=\"blocked\"}[5m])))", "format": "table", "instant": true, "refId": "A"}],
-          "title": "Top Rate Limited Subdomains",
-          "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true}, "indexByName": {}, "renameByName": {"Value": "Blocked/sec", "subdomain": "Subdomain"}}}],
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 101},
+          "id": 90,
+          "options": {"footer": {"fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": false, "displayName": "Status"}]},
+          "targets": [{"expr": "proxy_backend_health_status{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}", "format": "table", "instant": true, "refId": "A"}],
+          "title": "Backend Health Status",
+          "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "__name__": true, "environment": true, "instance": true, "job": true}, "indexByName": {}, "renameByName": {"Value": "Status", "backend": "Backend", "subdomain": "Subdomain"}}}],
           "type": "table"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "max": 1,
+              "min": 0,
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}]},
+              "unit": "percentunit"
+            },
+            "overrides": [
+              {"matcher": {"id": "byRegexp", "options": ".*success"}, "properties": [{"id": "color", "value": {"fixedColor": "green", "mode": "fixed"}}]},
+              {"matcher": {"id": "byRegexp", "options": ".*failure"}, "properties": [{"id": "color", "value": {"fixedColor": "red", "mode": "fixed"}}]}
+            ]
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 101},
+          "id": 91,
+          "options": {"legend": {"calcs": ["mean", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [
+            {"expr": "sum by (subdomain, result) (rate(proxy_health_checks_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])) / sum by (subdomain) (rate(proxy_health_checks_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "legendFormat": "{{subdomain}}: {{result}}", "refId": "A"}
+          ],
+          "title": "Health Check Success Rate",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.1}, {"color": "red", "value": 1}]},
+              "unit": "reqps"
+            }
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 109},
+          "id": 92,
+          "options": {"legend": {"calcs": ["sum", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"expr": "sum by (subdomain) (rate(proxy_fallback_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\"}[5m]))", "legendFormat": "{{subdomain}}", "refId": "A"}],
+          "title": "Fallback Backend Activation Rate",
+          "type": "timeseries"
+        },
+        {
+          "datasource": "Prometheus",
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {"axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": {"tooltip": false, "viz": false, "legend": false}, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": {"type": "linear"}, "showPoints": "never", "spanNulls": true, "stacking": {"group": "A", "mode": "none"}, "thresholdsStyle": {"mode": "off"}},
+              "mappings": [],
+              "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.01}, {"color": "red", "value": 0.1}]},
+              "unit": "reqps"
+            }
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 109},
+          "id": 93,
+          "options": {"legend": {"calcs": ["sum", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+          "targets": [{"expr": "sum by (subdomain) (rate(proxy_all_backends_unhealthy_total{environment=~\"$environment\",subdomain=~\"$subdomain\"}[5m]))", "legendFormat": "{{subdomain}}", "refId": "A"}],
+          "title": "All Backends Down (503 Responses)",
+          "type": "timeseries"
         }
       ],
       "refresh": "30s",
       "schemaVersion": 36,
       "style": "dark",
-      "tags": ["taiji", "proxy", "multi-backend"],
+      "tags": ["taiji", "proxy", "multi-backend", "p95"],
       "templating": {
         "list": [
+          {
+            "allValue": null,
+            "current": {"selected": true, "text": "production", "value": "production"},
+            "description": "Environment",
+            "hide": 0,
+            "includeAll": true,
+            "label": "Environment",
+            "multi": false,
+            "name": "environment",
+            "options": [
+              {"selected": true, "text": "production", "value": "production"},
+              {"selected": false, "text": "staging", "value": "staging"}
+            ],
+            "query": "production,staging",
+            "skipUrlSync": false,
+            "sort": 0,
+            "tagValuesQuery": "",
+            "tags": [],
+            "tagsQuery": "",
+            "type": "custom"
+          },
           {
             "allValue": ".*",
             "current": {"selected": true, "text": "All", "value": "$__all"},
@@ -867,7 +1035,7 @@ data:
       "time": {"from": "now-1h", "to": "now"},
       "timepicker": {"refresh_intervals": ["10s", "30s", "1m", "5m", "15m", "30m", "1h"]},
       "timezone": "browser",
-      "title": "Taiji Reverse Proxy (Multi-Backend)",
+      "title": "Taiji Reverse Proxy (Multi-Backend) - P95 Focus",
       "uid": "taiji",
-      "version": 3
+      "version": 4
     }

@@ -1,0 +1,29 @@
+# Test configuration for health checks and fallbacks
+services:
+  # Service with health check and fallback
+  - name: test_health_fallback
+    rate_limit: "100/1m"
+    health_check:
+      path: "/get"
+      method: "GET"  # HTTP method (default: GET)
+      timeout: 5  # Timeout in seconds (default: 5)
+      failure_threshold: 3  # Custom threshold for faster testing
+    backends:
+      - url: "http://httpbin1"
+        strip_path: false
+        strip_query: false
+      - url: "http://httpbin2"
+        strip_path: false
+        strip_query: false
+    fallbacks:
+      # When both primaries fail, use Redis health endpoint as fallback
+      - url: "http://redis:6379"
+        strip_path: false
+        strip_query: false
+
+  # Service without health check (always healthy)
+  - name: no_health_check
+    backends:
+      - url: "http://httpbin1"
+        strip_path: false
+        strip_query: false
