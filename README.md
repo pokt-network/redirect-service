@@ -119,7 +119,7 @@ Control retry behavior with `Retry-Policy` header:
 
 | Variable                  | Default                 | Description                                          |
 |---------------------------|-------------------------|------------------------------------------------------|
-| `CSV_PATH`                | `examples/proxies.yaml` | Path to YAML configuration file                      |
+| `CONFIG_PATH`             | `examples/proxies.yaml` | Path to YAML configuration file                      |
 | `PORT`                    | `8080`                 | HTTP server port                                     |
 | `RATE_LIMIT_ENABLED`      | `true`                 | Enable/disable rate limiting                         |
 | `RATE_LIMIT_DEFAULT`      | `100/1m`               | Default rate limit (requests/duration)               |
@@ -193,7 +193,7 @@ spec:
 **Binary:**
 ```bash
 make build
-CSV_PATH=/path/to/proxies.yaml ./bin/taiji
+CONFIG_PATH=/path/to/proxies.yaml ./bin/taiji
 ```
 
 ## API Endpoints

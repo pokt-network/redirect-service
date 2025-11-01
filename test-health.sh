@@ -36,7 +36,7 @@ wait_for_health_check() {
 
 echo "📋 Step 1: Starting services with test configuration..."
 docker-compose down -v 2>/dev/null || true
-export CSV_PATH=/config/test-health-fallback.yaml
+export CONFIG_PATH=/config/test-health-fallback.yaml
 docker-compose up -d
 sleep 8
 

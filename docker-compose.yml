@@ -26,7 +26,7 @@ services:
       - "8081:8080"
     environment:
       - PORT=8080
-      - CSV_PATH=/config/proxies.yaml
+      - CONFIG_PATH=/config/proxies.yaml
       - REDIS_ADDR=redis:6379
       - RATE_LIMIT_ENABLED=true
       - RATE_LIMIT_DEFAULT=100/1m
@@ -51,7 +51,7 @@ services:
     container_name: taiji-2
     environment:
       - PORT=8080
-      - CSV_PATH=/config/proxies.yaml
+      - CONFIG_PATH=/config/proxies.yaml
       - REDIS_ADDR=redis:6379
       - RATE_LIMIT_ENABLED=true
       - RATE_LIMIT_DEFAULT=100/1m
