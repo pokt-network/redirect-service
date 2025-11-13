@@ -38,6 +38,18 @@ services:
         strip_path: false
         strip_query: false
 
+  # Round-robin load balancing with multiple backends weighted by 3:1 ratio
+  - name: rr_test
+    backends:
+      - url: "http://localhost:4040"
+        strip_path: false
+        strip_query: false
+        weight: 3 # 75% of traffic
+      - url: "http://localhost:4041"
+        strip_path: false
+        strip_query: false
+        weight: 1 # 25% of traffic
+
   # Backend with custom headers
   - name: custom_headers
     backends:
