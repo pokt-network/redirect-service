@@ -1170,17 +1170,27 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if retryPolicy == "retry-all" && len(backends) > 1 {
-		// Try all backends until success (2xx) or all exhausted
+		triedURLs := make(map[string]bool) // Track which backends we've tried
 		attemptCount := 0
-		for i := 0; i < len(backends); i++ {
+		maxAttempts := len(backends) * 2 // Safety limit to prevent infinite loop
+
+		for attemptCount < maxAttempts {
 			rule := lb.Next()
 
-			success, _, shouldReturn := s.tryBackend(w, r, subdomain, rule, start, host, clientIP, i == len(backends)-1)
+			// Skip if already tried this backend
+			if triedURLs[rule.ProxyTo] {
+				attemptCount++
+				continue
+			}
+			triedURLs[rule.ProxyTo] = true
+
+			isLastAttempt := len(triedURLs) >= len(backends) // Check if we've tried all unique backends
+			success, _, shouldReturn := s.tryBackend(w, r, subdomain, rule, start, host, clientIP, isLastAttempt)
 			attemptCount++
 
 			if success {
 				// Track retry outcome - successfully after trying multiple backends
-				if attemptCount > 1 {
+				if len(triedURLs) > 1 {
 					proxyRetryAttemptsTotal.WithLabelValues(subdomain, "success").Inc()
 				}
 				return
@@ -1188,14 +1198,18 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 
 			if shouldReturn {
 				// This was the last attempt and it failed
-				if attemptCount > 1 {
+				if len(triedURLs) > 1 {
 					proxyRetryAttemptsTotal.WithLabelValues(subdomain, "all_failed").Inc()
 				}
 				return
 			}
+
 			// Continue to the next backend
 		}
-		// All backends exhausted without response (shouldn't reach here)
+		// All unique backends exhausted
+		if len(triedURLs) > 1 {
+			proxyRetryAttemptsTotal.WithLabelValues(subdomain, "all_failed").Inc()
+		}
 		return
 	}
 
