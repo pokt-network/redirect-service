@@ -27,7 +27,7 @@ jobs:
         uses: golangci/golangci-lint-action@v8
         with:
           version: v2.1
-          args: ./app/... ./cmd/... ./pkg/... --tests=false --timeout=5m
+          args: --timeout=5m
 
   go-fmt-check:
     name: Go Format Check (gofmt + goimports)
@@ -62,7 +62,6 @@ jobs:
             echo "::error ::goimports would reformat the files above. Run 'make fmt'."
             exit 1
           fi
-
 
   build-and-push:
     runs-on: ubuntu-latest

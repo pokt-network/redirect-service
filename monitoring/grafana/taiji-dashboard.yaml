@@ -56,8 +56,8 @@ data:
           "id": 2,
           "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
           "pluginVersion": "9.0.0",
-          "targets": [{"expr": "sum(rate(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "refId": "A"}],
-          "title": "Request Rate",
+          "targets": [{"expr": "sum(rate(proxy_requests_total{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[$__rate_interval]))", "refId": "A"}],
+          "title": "RPC Request Rate",
           "type": "stat"
         },
         {
@@ -75,8 +75,8 @@ data:
           "id": 3,
           "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
           "pluginVersion": "9.0.0",
-          "targets": [{"expr": "sum(increase(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[24h]))", "refId": "A"}],
-          "title": "24h Total Requests",
+          "targets": [{"expr": "sum(increase(proxy_requests_total{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__range]))", "refId": "A"}],
+          "title": "Total RPC Requests (Time Window)",
           "type": "stat"
         },
         {
@@ -94,8 +94,8 @@ data:
           "id": 4,
           "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
           "pluginVersion": "9.0.0",
-          "targets": [{"expr": "histogram_quantile(0.95, sum(rate(proxy_request_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])) by (le))", "refId": "A"}],
-          "title": "P95 Total Latency",
+          "targets": [{"expr": "histogram_quantile(0.95, sum(rate(proxy_request_duration_seconds_bucket{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])) by (le))", "refId": "A"}],
+          "title": "P95 RPC Latency",
           "type": "stat"
         },
         {
@@ -113,8 +113,8 @@ data:
           "id": 5,
           "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
           "pluginVersion": "9.0.0",
-          "targets": [{"expr": "histogram_quantile(0.95, sum(rate(proxy_overhead_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])) by (le))", "refId": "A"}],
-          "title": "P95 Proxy Overhead",
+          "targets": [{"expr": "histogram_quantile(0.95, sum(rate(proxy_overhead_duration_seconds_bucket{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])) by (le))", "refId": "A"}],
+          "title": "P95 RPC Overhead",
           "type": "stat"
         },
         {
@@ -132,8 +132,8 @@ data:
           "id": 6,
           "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
           "pluginVersion": "9.0.0",
-          "targets": [{"expr": "histogram_quantile(0.95, sum(rate(proxy_backend_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])) by (le))", "refId": "A"}],
-          "title": "P95 Backend Latency",
+          "targets": [{"expr": "histogram_quantile(0.95, sum(rate(proxy_backend_duration_seconds_bucket{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])) by (le))", "refId": "A"}],
+          "title": "P95 RPC Backend Latency",
           "type": "stat"
         },
         {
@@ -153,8 +153,8 @@ data:
           "id": 7,
           "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
           "pluginVersion": "9.0.0",
-          "targets": [{"expr": "sum(rate(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"4..|5..\"}[5m])) / sum(rate(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "refId": "A"}],
-          "title": "Error Rate",
+          "targets": [{"expr": "sum(rate(proxy_requests_total{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"4..|5..\"}[$__rate_interval])) / sum(rate(proxy_requests_total{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[$__rate_interval]))", "refId": "A"}],
+          "title": "RPC Error Rate",
           "type": "stat"
         },
         {
@@ -174,8 +174,8 @@ data:
           "id": 8,
           "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "center", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "text": {}, "textMode": "value"},
           "pluginVersion": "9.0.0",
-          "targets": [{"expr": "100 * (sum(rate(proxy_overhead_duration_seconds_sum{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])) / sum(rate(proxy_request_duration_seconds_sum{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "refId": "A"}],
-          "title": "Proxy Overhead %",
+          "targets": [{"expr": "100 * (sum(rate(proxy_overhead_duration_seconds_sum{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])) / sum(rate(proxy_request_duration_seconds_sum{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])))", "refId": "A"}],
+          "title": "RPC Overhead %",
           "type": "stat"
         },
         {
@@ -200,8 +200,8 @@ data:
           "gridPos": {"h": 8, "w": 16, "x": 0, "y": 8},
           "id": 10,
           "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-          "targets": [{"expr": "sum by (subdomain) (rate(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m]))", "legendFormat": "{{subdomain}}", "refId": "A"}],
-          "title": "Request Rate by Subdomain",
+          "targets": [{"expr": "sum by (subdomain) (rate(proxy_requests_total{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval]))", "legendFormat": "{{subdomain}}", "refId": "A"}],
+          "title": "RPC Request Rate by Subdomain",
           "type": "timeseries"
         },
         {
@@ -224,9 +224,9 @@ data:
           "id": 11,
           "options": {"footer": {"fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": true, "displayName": "Mean"}]},
           "targets": [
-            {"expr": "sum by (subdomain) (rate(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m]))", "format": "table", "instant": true, "refId": "A"}
+            {"expr": "sum by (subdomain) (rate(proxy_requests_total{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval]))", "format": "table", "instant": true, "refId": "A"}
           ],
-          "title": "Traffic Ranking (req/s)",
+          "title": "RPC Traffic Ranking (req/s)",
           "transformations": [
             {"id": "organize", "options": {"excludeByName": {"Time": true}, "indexByName": {}, "renameByName": {"Value": "Req/s", "subdomain": "Subdomain"}}}
           ],
@@ -255,9 +255,9 @@ data:
           "id": 20,
           "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
           "targets": [
-            {"expr": "histogram_quantile(0.95, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "legendFormat": "{{subdomain}}", "refId": "A"}
+            {"expr": "histogram_quantile(0.95, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])))", "legendFormat": "{{subdomain}}", "refId": "A"}
           ],
-          "title": "P95 Total Latency by Subdomain",
+          "title": "P95 RPC Latency by Subdomain",
           "type": "timeseries"
         },
         {
@@ -280,10 +280,10 @@ data:
           "id": 21,
           "options": {"footer": {"fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": true, "displayName": "Mean"}]},
           "targets": [
-            {"expr": "histogram_quantile(0.95, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "format": "table", "instant": true, "refId": "A"},
-            {"expr": "histogram_quantile(0.90, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "format": "table", "instant": true, "refId": "B"}
+            {"expr": "histogram_quantile(0.95, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])))", "format": "table", "instant": true, "refId": "A"},
+            {"expr": "histogram_quantile(0.90, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])))", "format": "table", "instant": true, "refId": "B"}
           ],
-          "title": "P95 Latency Table (Mean + P90)",
+          "title": "P95 RPC Latency Table (P95 + P90)",
           "transformations": [
             {"id": "merge", "options": {}},
             {"id": "organize", "options": {"excludeByName": {"Time": true}, "indexByName": {}, "renameByName": {"Value #A": "Mean", "Value #B": "P90", "subdomain": "Subdomain"}}}
@@ -314,8 +314,8 @@ data:
           "gridPos": {"h": 8, "w": 12, "x": 0, "y": 26},
           "id": 30,
           "options": {"legend": {"calcs": ["mean", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-          "targets": [{"expr": "sum by (subdomain, backend) (rate(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"5..\"}[5m])) / sum by (subdomain, backend) (rate(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "legendFormat": "{{subdomain}}/{{backend}}", "refId": "A"}],
-          "title": "5xx Error Rate by Backend",
+          "targets": [{"expr": "sum by (subdomain, backend) (rate(proxy_requests_total{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"5..\"}[$__rate_interval])) / sum by (subdomain, backend) (rate(proxy_requests_total{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[$__rate_interval]))", "legendFormat": "{{subdomain}}/{{backend}}", "refId": "A"}],
+          "title": "RPC 5xx Error Rate by Backend",
           "type": "timeseries"
         },
         {
@@ -332,8 +332,8 @@ data:
           "gridPos": {"h": 8, "w": 6, "x": 12, "y": 26},
           "id": 31,
           "options": {"legend": {"calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-          "targets": [{"expr": "sum by (subdomain, backend) (rate(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=\"502\"}[5m]))", "legendFormat": "{{subdomain}}/{{backend}}", "refId": "A"}],
-          "title": "502 Errors (Backend Down)",
+          "targets": [{"expr": "sum by (subdomain, backend) (rate(proxy_requests_total{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=\"502\"}[$__rate_interval]))", "legendFormat": "{{subdomain}}/{{backend}}", "refId": "A"}],
+          "title": "RPC 502 Errors (Backend Down)",
           "type": "timeseries"
         },
         {
@@ -350,8 +350,8 @@ data:
           "gridPos": {"h": 8, "w": 6, "x": 18, "y": 26},
           "id": 32,
           "options": {"legend": {"calcs": ["mean", "last"], "displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-          "targets": [{"expr": "sum by (status_code) (rate(proxy_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "legendFormat": "{{status_code}}", "refId": "A"}],
-          "title": "Status Codes",
+          "targets": [{"expr": "sum by (status_code) (rate(proxy_requests_total{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[$__rate_interval]))", "legendFormat": "{{status_code}}", "refId": "A"}],
+          "title": "RPC Status Codes",
           "type": "timeseries"
         },
         {
@@ -374,10 +374,10 @@ data:
           "id": 33,
           "options": {"legend": {"calcs": ["mean", "max", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
           "targets": [
-            {"expr": "histogram_quantile(0.95, sum by (status_code, le) (rate(proxy_request_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"4..|5..\"}[5m])))", "legendFormat": "{{status_code}} - Total", "refId": "A"},
-            {"expr": "histogram_quantile(0.95, sum by (status_code, le) (rate(proxy_overhead_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"4..|5..\"}[5m])))", "legendFormat": "{{status_code}} - Overhead", "refId": "B"}
+            {"expr": "histogram_quantile(0.95, sum by (status_code, le) (rate(proxy_request_duration_seconds_bucket{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"4..|5..\"}[$__rate_interval])))", "legendFormat": "{{status_code}} - Total", "refId": "A"},
+            {"expr": "histogram_quantile(0.95, sum by (status_code, le) (rate(proxy_overhead_duration_seconds_bucket{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"4..|5..\"}[$__rate_interval])))", "legendFormat": "{{status_code}} - Overhead", "refId": "B"}
           ],
-          "title": "P95 Failure Latency by Status Code (4xx/5xx)",
+          "title": "P95 RPC Failure Latency by Status Code (4xx/5xx)",
           "type": "timeseries"
         },
         {
@@ -407,10 +407,10 @@ data:
           "id": 40,
           "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
           "targets": [
-            {"expr": "sum by (subdomain) (rate(proxy_backend_duration_seconds_sum{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])) / sum by (subdomain) (rate(proxy_backend_duration_seconds_count{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m]))", "legendFormat": "{{subdomain}} - Backend", "refId": "A"},
-            {"expr": "sum by (subdomain) (rate(proxy_overhead_duration_seconds_sum{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])) / sum by (subdomain) (rate(proxy_overhead_duration_seconds_count{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m]))", "legendFormat": "{{subdomain}} - Overhead", "refId": "B"}
+            {"expr": "sum by (subdomain) (rate(proxy_backend_duration_seconds_sum{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])) / sum by (subdomain) (rate(proxy_backend_duration_seconds_count{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval]))", "legendFormat": "{{subdomain}} - Backend", "refId": "A"},
+            {"expr": "sum by (subdomain) (rate(proxy_overhead_duration_seconds_sum{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])) / sum by (subdomain) (rate(proxy_overhead_duration_seconds_count{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval]))", "legendFormat": "{{subdomain}} - Overhead", "refId": "B"}
           ],
-          "title": "Latency Components: Backend vs Proxy Overhead (Stacked)",
+          "title": "RPC Latency Components: Backend vs Proxy Overhead (Stacked)",
           "type": "timeseries"
         },
         {
@@ -433,11 +433,11 @@ data:
           "id": 41,
           "options": {"footer": {"fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": true, "displayName": "Overhead (ms)"}]},
           "targets": [
-            {"expr": "1000 * (sum by (subdomain) (rate(proxy_overhead_duration_seconds_sum{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])) / sum by (subdomain) (rate(proxy_overhead_duration_seconds_count{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "format": "table", "instant": true, "refId": "A"},
-            {"expr": "1000 * (sum by (subdomain) (rate(proxy_backend_duration_seconds_sum{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])) / sum by (subdomain) (rate(proxy_backend_duration_seconds_count{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "format": "table", "instant": true, "refId": "B"},
-            {"expr": "100 * (sum by (subdomain) (rate(proxy_overhead_duration_seconds_sum{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])) / sum by (subdomain) (rate(proxy_request_duration_seconds_sum{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "format": "table", "instant": true, "refId": "C"}
+            {"expr": "1000 * (sum by (subdomain) (rate(proxy_overhead_duration_seconds_sum{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])) / sum by (subdomain) (rate(proxy_overhead_duration_seconds_count{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])))", "format": "table", "instant": true, "refId": "A"},
+            {"expr": "1000 * (sum by (subdomain) (rate(proxy_backend_duration_seconds_sum{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])) / sum by (subdomain) (rate(proxy_backend_duration_seconds_count{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])))", "format": "table", "instant": true, "refId": "B"},
+            {"expr": "100 * (sum by (subdomain) (rate(proxy_overhead_duration_seconds_sum{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])) / sum by (subdomain) (rate(proxy_request_duration_seconds_sum{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])))", "format": "table", "instant": true, "refId": "C"}
           ],
-          "title": "Latency Breakdown Table",
+          "title": "RPC Latency Breakdown Table",
           "transformations": [
             {"id": "merge", "options": {}},
             {"id": "organize", "options": {"excludeByName": {"Time": true}, "indexByName": {}, "renameByName": {"Value #A": "Overhead (ms)", "Value #B": "Backend (ms)", "Value #C": "Overhead %", "subdomain": "Subdomain"}}}
@@ -479,7 +479,7 @@ data:
             "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
             "textMode": "value"
           },
-          "targets": [{"expr": "sum(rate(proxy_ratelimit_requests_total{job=\"taiji\",environment=~\"$environment\",action=\"blocked\"}[5m])) / sum(rate(proxy_ratelimit_requests_total{job=\"taiji\",environment=~\"$environment\"}[5m]))", "legendFormat": "Block Rate", "refId": "A"}],
+          "targets": [{"expr": "sum(rate(proxy_ratelimit_requests_total{job=\"taiji\",environment=~\"$environment\",action=\"blocked\"}[$__rate_interval])) / sum(rate(proxy_ratelimit_requests_total{job=\"taiji\",environment=~\"$environment\"}[$__rate_interval]))", "legendFormat": "Block Rate", "refId": "A"}],
           "title": "Block Rate",
           "type": "stat"
         },
@@ -502,8 +502,8 @@ data:
           "id": 51,
           "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
           "targets": [
-            {"expr": "sum by (subdomain) (rate(proxy_ratelimit_requests_total{job=\"taiji\",environment=~\"$environment\",subdomain=~\"$subdomain\",action=\"allowed\"}[5m]))", "legendFormat": "{{subdomain}} - Allowed", "refId": "A"},
-            {"expr": "sum by (subdomain) (rate(proxy_ratelimit_requests_total{job=\"taiji\",environment=~\"$environment\",subdomain=~\"$subdomain\",action=\"blocked\"}[5m]))", "legendFormat": "{{subdomain}} - Blocked", "refId": "B"}
+            {"expr": "sum by (subdomain) (rate(proxy_ratelimit_requests_total{job=\"taiji\",environment=~\"$environment\",subdomain=~\"$subdomain\",action=\"allowed\"}[$__rate_interval]))", "legendFormat": "{{subdomain}} - Allowed", "refId": "A"},
+            {"expr": "sum by (subdomain) (rate(proxy_ratelimit_requests_total{job=\"taiji\",environment=~\"$environment\",subdomain=~\"$subdomain\",action=\"blocked\"}[$__rate_interval]))", "legendFormat": "{{subdomain}} - Blocked", "refId": "B"}
           ],
           "title": "Rate Limit: Allowed vs Blocked",
           "type": "timeseries"
@@ -527,7 +527,7 @@ data:
           "gridPos": {"h": 8, "w": 8, "x": 16, "y": 52},
           "id": 52,
           "options": {"footer": {"fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": true, "displayName": "Mean"}]},
-          "targets": [{"expr": "topk(20, sum by (subdomain) (rate(proxy_ratelimit_requests_total{job=\"taiji\",environment=~\"$environment\",action=\"blocked\"}[5m])))", "format": "table", "instant": true, "refId": "A"}],
+          "targets": [{"expr": "topk(20, sum by (subdomain) (rate(proxy_ratelimit_requests_total{job=\"taiji\",environment=~\"$environment\",action=\"blocked\"}[$__rate_interval])))", "format": "table", "instant": true, "refId": "A"}],
           "title": "Top Rate Limited Subdomains",
           "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true}, "indexByName": {}, "renameByName": {"Value": "Blocked/sec", "subdomain": "Subdomain"}}}],
           "type": "table"
@@ -560,7 +560,7 @@ data:
             "reduceOptions": {"calcs": ["mean"], "fields": "", "values": false},
             "textMode": "value"
           },
-          "targets": [{"expr": "sum(rate(proxy_ratelimit_check_duration_seconds_sum{job=\"taiji\",environment=~\"$environment\"}[5m])) / sum(rate(proxy_ratelimit_check_duration_seconds_count{job=\"taiji\",environment=~\"$environment\"}[5m]))", "legendFormat": "Avg Latency", "refId": "A"}],
+          "targets": [{"expr": "sum(rate(proxy_ratelimit_check_duration_seconds_sum{job=\"taiji\",environment=~\"$environment\"}[$__rate_interval])) / sum(rate(proxy_ratelimit_check_duration_seconds_count{job=\"taiji\",environment=~\"$environment\"}[$__rate_interval]))", "legendFormat": "Avg Latency", "refId": "A"}],
           "title": "Redis Avg Latency",
           "type": "stat"
         },
@@ -592,7 +592,7 @@ data:
             "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
             "textMode": "value"
           },
-          "targets": [{"expr": "histogram_quantile(0.95, sum(rate(proxy_ratelimit_check_duration_seconds_bucket{job=\"taiji\",environment=~\"$environment\"}[5m])) by (le))", "legendFormat": "P95 Latency", "refId": "A"}],
+          "targets": [{"expr": "histogram_quantile(0.95, sum(rate(proxy_ratelimit_check_duration_seconds_bucket{job=\"taiji\",environment=~\"$environment\"}[$__rate_interval])) by (le))", "legendFormat": "P95 Latency", "refId": "A"}],
           "title": "Redis P95 Latency",
           "type": "stat"
         },
@@ -623,7 +623,7 @@ data:
             "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
             "textMode": "value_and_name"
           },
-          "targets": [{"expr": "rate(proxy_ratelimit_redis_errors_total{job=\"taiji\",environment=~\"$environment\"}[5m])", "legendFormat": "Redis Errors/sec", "refId": "A"}],
+          "targets": [{"expr": "rate(proxy_ratelimit_redis_errors_total{job=\"taiji\",environment=~\"$environment\"}[$__rate_interval])", "legendFormat": "Redis Errors/sec", "refId": "A"}],
           "title": "Redis Errors",
           "type": "stat"
         },
@@ -642,9 +642,9 @@ data:
           "id": 56,
           "options": {"legend": {"calcs": ["mean", "max", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "single", "sort": "none"}},
           "targets": [
-            {"expr": "histogram_quantile(0.99, sum(rate(proxy_ratelimit_check_duration_seconds_bucket{job=\"taiji\",environment=~\"$environment\"}[5m])) by (le))", "legendFormat": "P99", "refId": "A"},
-            {"expr": "histogram_quantile(0.95, sum(rate(proxy_ratelimit_check_duration_seconds_bucket{job=\"taiji\",environment=~\"$environment\"}[5m])) by (le))", "legendFormat": "P95", "refId": "B"},
-            {"expr": "histogram_quantile(0.50, sum(rate(proxy_ratelimit_check_duration_seconds_bucket{job=\"taiji\",environment=~\"$environment\"}[5m])) by (le))", "legendFormat": "P50", "refId": "C"}
+            {"expr": "histogram_quantile(0.99, sum(rate(proxy_ratelimit_check_duration_seconds_bucket{job=\"taiji\",environment=~\"$environment\"}[$__rate_interval])) by (le))", "legendFormat": "P99", "refId": "A"},
+            {"expr": "histogram_quantile(0.95, sum(rate(proxy_ratelimit_check_duration_seconds_bucket{job=\"taiji\",environment=~\"$environment\"}[$__rate_interval])) by (le))", "legendFormat": "P95", "refId": "B"},
+            {"expr": "histogram_quantile(0.50, sum(rate(proxy_ratelimit_check_duration_seconds_bucket{job=\"taiji\",environment=~\"$environment\"}[$__rate_interval])) by (le))", "legendFormat": "P50", "refId": "C"}
           ],
           "title": "Redis Rate Limit Check Latency (P50/P95/P99)",
           "type": "timeseries"
@@ -672,9 +672,9 @@ data:
           "id": 60,
           "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
           "targets": [
-            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "legendFormat": "{{subdomain}}", "refId": "A"}
+            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])))", "legendFormat": "{{subdomain}}", "refId": "A"}
           ],
-          "title": "P99 Total Latency by Subdomain",
+          "title": "P99 RPC Latency by Subdomain",
           "type": "timeseries"
         },
         {
@@ -692,9 +692,9 @@ data:
           "id": 61,
           "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
           "targets": [
-            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_overhead_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "legendFormat": "{{subdomain}}", "refId": "A"}
+            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_overhead_duration_seconds_bucket{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])))", "legendFormat": "{{subdomain}}", "refId": "A"}
           ],
-          "title": "P99 Proxy Overhead",
+          "title": "P99 RPC Overhead",
           "type": "timeseries"
         },
         {
@@ -712,9 +712,9 @@ data:
           "id": 62,
           "options": {"legend": {"calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
           "targets": [
-            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_backend_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "legendFormat": "{{subdomain}}", "refId": "A"}
+            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_backend_duration_seconds_bucket{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])))", "legendFormat": "{{subdomain}}", "refId": "A"}
           ],
-          "title": "P99 Backend Latency",
+          "title": "P99 RPC Backend Latency",
           "type": "timeseries"
         },
         {
@@ -738,12 +738,12 @@ data:
           "id": 63,
           "options": {"footer": {"fields": "", "reducer": ["sum"], "show": false}, "showHeader": true, "sortBy": [{"desc": true, "displayName": "P99 Total"}]},
           "targets": [
-            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "format": "table", "instant": true, "refId": "A"},
-            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_overhead_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "format": "table", "instant": true, "refId": "B"},
-            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_backend_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "format": "table", "instant": true, "refId": "C"},
-            {"expr": "histogram_quantile(1.0, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[5m])))", "format": "table", "instant": true, "refId": "D"}
+            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])))", "format": "table", "instant": true, "refId": "A"},
+            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_overhead_duration_seconds_bucket{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])))", "format": "table", "instant": true, "refId": "B"},
+            {"expr": "histogram_quantile(0.99, sum by (subdomain, le) (rate(proxy_backend_duration_seconds_bucket{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])))", "format": "table", "instant": true, "refId": "C"},
+            {"expr": "histogram_quantile(1.0, sum by (subdomain, le) (rate(proxy_request_duration_seconds_bucket{kind=\"rpc\",environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\",status_code=~\"2..\"}[$__rate_interval])))", "format": "table", "instant": true, "refId": "D"}
           ],
-          "title": "P99 Breakdown Table (with Max)",
+          "title": "P99 RPC Breakdown Table (with Max)",
           "transformations": [
             {"id": "merge", "options": {}},
             {"id": "organize", "options": {"excludeByName": {"Time": true}, "indexByName": {}, "renameByName": {"Value #A": "P99 Total", "Value #B": "P99 Overhead", "Value #C": "P99 Backend", "Value #D": "Max", "subdomain": "Subdomain"}}}
@@ -777,7 +777,7 @@ data:
           "id": 70,
           "options": {"legend": {"calcs": ["sum", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
           "targets": [
-            {"expr": "sum by (subdomain, outcome) (rate(proxy_retry_attempts_total{environment=~\"$environment\",subdomain=~\"$subdomain\"}[5m]))", "legendFormat": "{{subdomain}}: {{outcome}}", "refId": "A"}
+            {"expr": "sum by (subdomain, outcome) (rate(proxy_retry_attempts_total{environment=~\"$environment\",subdomain=~\"$subdomain\"}[$__rate_interval]))", "legendFormat": "{{subdomain}}: {{outcome}}", "refId": "A"}
           ],
           "title": "Retry Rate by Subdomain",
           "type": "timeseries"
@@ -797,7 +797,7 @@ data:
           "id": 71,
           "options": {"legend": {"calcs": ["sum", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
           "targets": [
-            {"expr": "sum by (subdomain, backend) (rate(proxy_backend_failures_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "legendFormat": "{{subdomain}}/{{backend}}", "refId": "A"}
+            {"expr": "sum by (subdomain, backend) (rate(proxy_backend_failures_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[$__rate_interval]))", "legendFormat": "{{subdomain}}/{{backend}}", "refId": "A"}
           ],
           "title": "Backend Failure Rate (Triggers Retries)",
           "type": "timeseries"
@@ -866,7 +866,7 @@ data:
           "gridPos": {"h": 7, "w": 10, "x": 14, "y": 93},
           "id": 82,
           "options": {"legend": {"calcs": ["sum", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
-          "targets": [{"expr": "rate(proxy_csv_reload_total[5m])", "legendFormat": "Attempts", "refId": "A"}, {"expr": "rate(proxy_csv_reload_errors_total[5m])", "legendFormat": "Errors", "refId": "B"}],
+          "targets": [{"expr": "rate(proxy_csv_reload_total[$__rate_interval])", "legendFormat": "Attempts", "refId": "A"}, {"expr": "rate(proxy_csv_reload_errors_total[$__rate_interval])", "legendFormat": "Errors", "refId": "B"}],
           "title": "CSV Reloads",
           "type": "timeseries"
         },
@@ -923,7 +923,7 @@ data:
           "id": 91,
           "options": {"legend": {"calcs": ["mean", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
           "targets": [
-            {"expr": "sum by (subdomain, result) (rate(proxy_health_checks_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m])) / sum by (subdomain) (rate(proxy_health_checks_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[5m]))", "legendFormat": "{{subdomain}}: {{result}}", "refId": "A"}
+            {"expr": "sum by (subdomain, result) (rate(proxy_health_checks_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[$__rate_interval])) / sum by (subdomain) (rate(proxy_health_checks_total{environment=~\"$environment\",subdomain=~\"$subdomain\",backend=~\"$backend\"}[$__rate_interval]))", "legendFormat": "{{subdomain}}: {{result}}", "refId": "A"}
           ],
           "title": "Health Check Success Rate",
           "type": "timeseries"
@@ -942,7 +942,7 @@ data:
           "gridPos": {"h": 8, "w": 12, "x": 0, "y": 109},
           "id": 92,
           "options": {"legend": {"calcs": ["sum", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-          "targets": [{"expr": "sum by (subdomain) (rate(proxy_fallback_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\"}[5m]))", "legendFormat": "{{subdomain}}", "refId": "A"}],
+          "targets": [{"expr": "sum by (subdomain) (rate(proxy_fallback_requests_total{environment=~\"$environment\",subdomain=~\"$subdomain\"}[$__rate_interval]))", "legendFormat": "{{subdomain}}", "refId": "A"}],
           "title": "Fallback Backend Activation Rate",
           "type": "timeseries"
         },
@@ -960,7 +960,7 @@ data:
           "gridPos": {"h": 8, "w": 12, "x": 12, "y": 109},
           "id": 93,
           "options": {"legend": {"calcs": ["sum", "last"], "displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
-          "targets": [{"expr": "sum by (subdomain) (rate(proxy_all_backends_unhealthy_total{environment=~\"$environment\",subdomain=~\"$subdomain\"}[5m]))", "legendFormat": "{{subdomain}}", "refId": "A"}],
+          "targets": [{"expr": "sum by (subdomain) (rate(proxy_all_backends_unhealthy_total{environment=~\"$environment\",subdomain=~\"$subdomain\"}[$__rate_interval]))", "legendFormat": "{{subdomain}}", "refId": "A"}],
           "title": "All Backends Down (503 Responses)",
           "type": "timeseries"
         }
