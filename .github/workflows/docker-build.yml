@@ -3,13 +3,66 @@ name: Build and Push Docker Image
 on:
   push:
     tags:
-      - 'v*'
+      - 'v*' # v1.4.0-dev1 v1.4.0
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/taiji
 
 jobs:
+  go-lint:
+    name: Go Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.24.x'
+          cache: true
+
+      - name: GolangCI-Lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.1
+          args: --timeout=5m
+
+  go-fmt-check:
+    name: Go Format Check (gofmt + goimports)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.24.x'
+          cache: true
+
+      - name: Install goimports
+        run: go install golang.org/x/tools/cmd/goimports@latest
+
+      - name: Check gofmt
+        run: |
+          CHANGED=$(gofmt -s -l . | tee /dev/stderr)
+          if [ -n "$CHANGED" ]; then
+            echo "::error ::gofmt would reformat the files above. Run 'make fmt'."
+            exit 1
+          fi
+
+      - name: Check goimports
+        run: |
+          # Only check .go files outside vendor (actions/checkout doesn't bring vendor by default)
+          FILES=$(git ls-files '*.go')
+          CHANGED=$(goimports -l $FILES | tee /dev/stderr)
+          if [ -n "$CHANGED" ]; then
+            echo "::error ::goimports would reformat the files above. Run 'make fmt'."
+            exit 1
+          fi
+
   build-and-push:
     runs-on: ubuntu-latest
     permissions:

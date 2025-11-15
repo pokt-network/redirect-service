@@ -45,6 +45,7 @@ const (
 	defaultPort           = "8080"
 	proxyMetadataField    = contextKey("proxy_metadata")
 	backendStartTimeField = contextKey("backend_start_time")
+	metricsContextKey     = contextKey("metrics_context")
 )
 
 // Pre-allocated status code strings to avoid allocations in a hot path
@@ -107,26 +108,26 @@ var (
 	// Request metrics by subdomain and backend
 	proxyRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "proxy_requests_total",
-		Help: "Total number of proxy requests by subdomain, backend, and status code",
-	}, []string{"subdomain", "backend", "status_code"})
+		Help: "Total number of proxy requests by subdomain, backend, status code, request kind, and retry status",
+	}, []string{"subdomain", "backend", "status_code", "kind", "retried"})
 
 	proxyRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "proxy_request_duration_seconds",
-		Help:    "Total proxy request duration in seconds (includes rate limiting, routing, backend, response) by subdomain, backend, and status code",
+		Help:    "Total proxy request duration in seconds (includes rate limiting, routing, backend, response) by subdomain, backend, status code, request kind, and retry status",
 		Buckets: prometheus.DefBuckets, // 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10
-	}, []string{"subdomain", "backend", "status_code"})
+	}, []string{"subdomain", "backend", "status_code", "kind", "retried"})
 
 	proxyBackendDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "proxy_backend_duration_seconds",
-		Help:    "Backend response time in seconds (time from sending request to backend until response received) by subdomain, backend, and status code",
+		Help:    "Backend response time in seconds (time from sending request to backend until response received) by subdomain, backend, status code, request kind, and retry status",
 		Buckets: prometheus.DefBuckets, // 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10
-	}, []string{"subdomain", "backend", "status_code"})
+	}, []string{"subdomain", "backend", "status_code", "kind", "retried"})
 
 	proxyOverheadDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "proxy_overhead_duration_seconds",
-		Help:    "Taiji proxy overhead in seconds (total time minus backend time, includes routing, header processing, streaming) by subdomain, backend, and status code",
+		Help:    "Taiji proxy overhead in seconds (total time minus backend time, includes routing, header processing, streaming) by subdomain, backend, status code, request kind, and retry status",
 		Buckets: []float64{0.0001, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1}, // 0.1ms to 100ms
-	}, []string{"subdomain", "backend", "status_code"})
+	}, []string{"subdomain", "backend", "status_code", "kind", "retried"})
 
 	// Last successful request timestamp by subdomain and backend
 	proxyLastRequestTimestamp = promauto.NewGaugeVec(prometheus.GaugeOpts{
@@ -354,6 +355,19 @@ type proxyMetadata struct {
 	originalQuery string
 }
 
+// metricsContext holds information for recording metrics at the end of request processing
+// This struct is created by the metricsWrapper middleware and populated by handlers
+type metricsContext struct {
+	subdomain      string
+	backend        string
+	kind           string
+	retried        bool
+	startTime      time.Time
+	backendStart   time.Time // when backend request started (for backend duration)
+	statusCode     int
+	metricsWritten bool // flag to prevent double-recording
+}
+
 // extractClientIP extracts the real client IP from request headers
 // Priority: Forwarded (RFC 7239) > CF-Connecting-IP > True-Client-IP > X-Forwarded-For > X-Real-IP > RemoteAddr
 func extractClientIP(r *http.Request, trustProxy bool) string {
@@ -419,6 +433,87 @@ func extractClientIP(r *http.Request, trustProxy bool) string {
 		return r.RemoteAddr
 	}
 	return ip
+}
+
+// normalizeBackendLabel extracts a normalized backend identifier from a full backend URL
+// for use as a Prometheus label, reducing cardinality while maintaining useful information.
+//
+// Rules:
+//   - IP addresses: kept as-is (e.g., "192.168.1.1")
+//   - Ports: stripped (e.g., "pocket.network:8545" → "pocket.network")
+//   - Domains: last 2 parts extracted (e.g., "eth.gateway.pocket.network" → "pocket.network")
+//   - Single-part domains: kept as-is (e.g., "localhost" → "localhost")
+//   - Malformed/empty: returns "unknown"
+//
+// Examples:
+//   - "https://eth.gateway.pocket.network/v1" → "pocket.network"
+//   - "http://eth.grove.city:443" → "grove.city"
+//   - "http://192.168.1.1:8080" → "192.168.1.1"
+//   - "http://localhost:8080" → "localhost"
+func normalizeBackendLabel(backendURL string) string {
+	if backendURL == "" {
+		return "unknown"
+	}
+
+	// Parse the URL to extract hostname
+	parsedURL, err := url.Parse(backendURL)
+	if err != nil || parsedURL.Host == "" {
+		// If URL parsing fails, try to use it as-is (might be just a hostname)
+		parsedURL, err = url.Parse("http://" + backendURL)
+		if err != nil {
+			return "unknown"
+		}
+	}
+
+	// Extract hostname (without port)
+	hostname := parsedURL.Hostname()
+	if hostname == "" {
+		return "unknown"
+	}
+
+	// Check if it's an IP address
+	if net.ParseIP(hostname) != nil {
+		return hostname
+	}
+
+	// Split domain into parts
+	parts := strings.Split(hostname, ".")
+
+	// If single-part domain (e.g., "localhost"), return as-is
+	if len(parts) == 1 {
+		return hostname
+	}
+
+	// Extract last 2 parts (e.g., "pocket.network" from "eth.gateway.pocket.network")
+	if len(parts) >= 2 {
+		return parts[len(parts)-2] + "." + parts[len(parts)-1]
+	}
+
+	// Fallback
+	return hostname
+}
+
+// getRequestKind determines the kind of request based on the URL path
+// Returns: "health", "ready", "metrics", or "rpc"
+func getRequestKind(path string) string {
+	switch path {
+	case "/health", "/healthz":
+		return "health"
+	case "/ready", "/readyz":
+		return "ready"
+	case "/metrics":
+		return "metrics"
+	default:
+		return "rpc"
+	}
+}
+
+// boolToString converts a boolean to "true" or "false" string for metric labels
+func boolToString(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
 }
 
 // parseRateLimit parses rate limit string format "requests/duration" (e.g., "100/1m", "1000/1h")
@@ -1039,7 +1134,7 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	// Extract subdomain from Host header
 	host := r.Host
 	if host == "" {
-		proxyRequestsTotal.WithLabelValues("unknown", "unknown", "400").Inc()
+		// Wrapper will record metrics with subdomain="unknown", backend="unknown", status=400
 		http.Error(w, "Bad Request: Missing Host header", http.StatusBadRequest)
 		return
 	}
@@ -1048,7 +1143,7 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	// Optimized: use IndexByte instead of Split to avoid allocation
 	firstDot := strings.IndexByte(host, '.')
 	if firstDot == -1 {
-		proxyRequestsTotal.WithLabelValues("unknown", "unknown", "400").Inc()
+		// Wrapper will record metrics with subdomain="unknown", backend="unknown", status=400
 		http.Error(w, "Bad Request: Invalid hostname format", http.StatusBadRequest)
 		return
 	}
@@ -1056,7 +1151,7 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	// Verify we have at least subdomain.x.y format
 	secondDot := strings.IndexByte(host[firstDot+1:], '.')
 	if secondDot == -1 {
-		proxyRequestsTotal.WithLabelValues("unknown", "unknown", "400").Inc()
+		// Wrapper will record metrics with subdomain="unknown", backend="unknown", status=400
 		http.Error(w, "Bad Request: Invalid hostname format", http.StatusBadRequest)
 		return
 	}
@@ -1067,7 +1162,7 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	rules := s.GetRules()
 	backends, exists := rules[subdomain]
 	if !exists || len(backends) == 0 {
-		proxyRequestsTotal.WithLabelValues(subdomain, "unknown", "404").Inc()
+		// Wrapper will record metrics with backend="unknown", status=404
 		http.Error(w, "Not Found: No proxy rule for this subdomain", http.StatusNotFound)
 		return
 	}
@@ -1091,7 +1186,7 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	// If still no healthy backends, return 503
 	if len(healthyBackends) == 0 {
 		proxyAllBackendsUnhealthyTotal.WithLabelValues(subdomain).Inc()
-		proxyRequestsTotal.WithLabelValues(subdomain, "unknown", "503").Inc()
+		// Wrapper will record metrics with backend="unknown", status=503
 		http.Error(w, "Service Unavailable: All backends are unhealthy", http.StatusServiceUnavailable)
 		return
 	}
@@ -1164,7 +1259,8 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	// Round-robin: get loadbalancer for this subdomain (using atomicgo/robin)
 	lb, exists := s.loadbalancers.Load(subdomain)
 	if !exists {
-		// This shouldn't happen since we rebuild loadbalancers on CSV load but fallback to the first backend
+		// This shouldn't happen since we rebuild loadbalancers on CSV load
+		// Wrapper will record metrics with backend="unknown", status=500
 		http.Error(w, "Internal Server Error: No loadbalancer found", http.StatusInternalServerError)
 		return
 	}
@@ -1221,7 +1317,7 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 // tryBackend attempts to proxy to a single backend
 // Returns (success, statusCode, shouldReturn) where:
 // - success: true if the request succeeded (2xx status)
-// - statusCode: the HTTP status code returned by the backend (0 of error before proxy)
+// - statusCode: the HTTP status code returned by the backend (0 if error before proxy)
 // - shouldReturn: true if we should stop trying more backends (error was written to response)
 func (s *ProxyService) tryBackend(w http.ResponseWriter, r *http.Request, subdomain string, rule ProxyRule, start time.Time, host string, clientIP string, isLastAttempt bool) (bool, int, bool) {
 	// Parse backend URL
@@ -1229,7 +1325,7 @@ func (s *ProxyService) tryBackend(w http.ResponseWriter, r *http.Request, subdom
 	if err != nil {
 		log.Printf("ERROR: Invalid proxy_to URL for subdomain '%s': %v", subdomain, err)
 		if isLastAttempt {
-			proxyRequestsTotal.WithLabelValues(subdomain, "unknown", "500").Inc()
+			// Wrapper will record metrics with backend="unknown", status=500
 			http.Error(w, "Internal Server Error: Invalid backend URL", http.StatusInternalServerError)
 			return false, 500, true
 		}
@@ -1252,6 +1348,14 @@ func (s *ProxyService) tryBackend(w http.ResponseWriter, r *http.Request, subdom
 		originalQuery: r.URL.RawQuery,
 	})
 	r = r.WithContext(ctx)
+
+	// Update metricsContext with backend info (after context is set)
+	if mctx, ok := r.Context().Value(metricsContextKey).(*metricsContext); ok {
+		mctx.backend = backend
+		if !isLastAttempt {
+			mctx.retried = true
+		}
+	}
 
 	// Get or create a cached proxy for this backend
 	cacheKey := targetURL.Scheme + "://" + targetURL.Host
@@ -1407,41 +1511,33 @@ func (s *ProxyService) createReverseProxy() *httputil.ReverseProxy {
 		Transport:  s.transport,
 		BufferPool: &BufferPool{}, // Reuse buffers across requests (reduces allocations & GC pressure)
 		ModifyResponse: func(resp *http.Response) error {
-			// Get metadata from context and update metrics
-			if meta, ok := resp.Request.Context().Value(proxyMetadataField).(proxyMetadata); ok {
-				now := time.Now()
-				totalDuration := now.Sub(meta.startTime).Seconds()
-
-				// Calculate backend duration (from Director start to ModifyResponse)
-				backendDuration := 0.0
-				if backendStartVal := resp.Request.Context().Value(backendStartTimeField); backendStartVal != nil {
-					if backendStart, ok := backendStartVal.(time.Time); ok {
-						backendDuration = now.Sub(backendStart).Seconds()
+			// Update metricsContext with backend timing
+			if backendStartVal := resp.Request.Context().Value(backendStartTimeField); backendStartVal != nil {
+				if backendStart, ok := backendStartVal.(time.Time); ok {
+					// Update metricsContext with backend start time for duration calculation
+					if mctx, ok := resp.Request.Context().Value(metricsContextKey).(*metricsContext); ok {
+						mctx.backendStart = backendStart
 					}
 				}
-
-				// Calculate proxy overhead (total - backend)
-				proxyOverhead := totalDuration - backendDuration
-				if proxyOverhead < 0 {
-					proxyOverhead = 0 // Safety check for clock skew
-				}
-
-				// Record metrics
-				statusCode := resp.StatusCode
-				statusCodeStr := statusCodeToString(statusCode)
-				proxyRequestsTotal.WithLabelValues(meta.subdomain, meta.backend, statusCodeStr).Inc()
-				proxyRequestDuration.WithLabelValues(meta.subdomain, meta.backend, statusCodeStr).Observe(totalDuration)
-				proxyBackendDuration.WithLabelValues(meta.subdomain, meta.backend, statusCodeStr).Observe(backendDuration)
-				proxyOverheadDuration.WithLabelValues(meta.subdomain, meta.backend, statusCodeStr).Observe(proxyOverhead)
-				proxyLastRequestTimestamp.WithLabelValues(meta.subdomain, meta.backend).Set(float64(now.Unix()))
 			}
+
+			// Update last request timestamp (not part of main metrics but useful gauge)
+			if meta, ok := resp.Request.Context().Value(proxyMetadataField).(proxyMetadata); ok {
+				proxyLastRequestTimestamp.WithLabelValues(meta.subdomain, meta.backend).Set(float64(time.Now().Unix()))
+			}
+
+			// Wrapper will record all main metrics
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
 			// Get metadata from context
 			if meta, ok := req.Context().Value(proxyMetadataField).(proxyMetadata); ok {
 				log.Printf("ERROR: Backend request failed for subdomain '%s' backend '%s': %v", meta.subdomain, meta.backend, err)
-				proxyRequestsTotal.WithLabelValues(meta.subdomain, meta.backend, statusCodeStrings[502]).Inc()
+
+				// Update metricsContext with backend info (in case it wasn't set earlier)
+				if mctx, ok := req.Context().Value(metricsContextKey).(*metricsContext); ok {
+					mctx.backend = meta.backend
+				}
 
 				// Passive health check: mark backend unhealthy on connection errors
 				s.recordPassiveHealthCheckFailure(meta.subdomain, meta.rule.ProxyTo)
@@ -1492,6 +1588,142 @@ func (s *ProxyService) HandleReady(w http.ResponseWriter, _ *http.Request) {
 	}
 }
 
+// responseWriterWrapper wraps http.ResponseWriter to capture status code
+type responseWriterWrapper struct {
+	http.ResponseWriter
+	statusCode int
+	written    bool
+}
+
+func (rw *responseWriterWrapper) WriteHeader(statusCode int) {
+	if !rw.written {
+		rw.statusCode = statusCode
+		rw.written = true
+		rw.ResponseWriter.WriteHeader(statusCode)
+	}
+}
+
+func (rw *responseWriterWrapper) Write(b []byte) (int, error) {
+	if !rw.written {
+		// If WriteHeader wasn't called explicitly, it's a 200
+		rw.statusCode = http.StatusOK
+		rw.written = true
+	}
+	return rw.ResponseWriter.Write(b)
+}
+
+// metricsWrapper wraps an HTTP handler to guarantee metrics recording for ALL requests
+// It creates a metricsContext that travels with the request, handlers populate it,
+// and the wrapper records metrics exactly once at the end via defer
+func metricsWrapper(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Create metrics context for this request
+		mctx := &metricsContext{
+			subdomain:      extractSubdomainFromHost(r.Host),
+			backend:        "unknown",
+			kind:           getRequestKind(r.URL.Path),
+			retried:        false,
+			startTime:      time.Now(),
+			statusCode:     http.StatusOK,
+			metricsWritten: false,
+		}
+
+		// Add metrics context to request context
+		ctx := context.WithValue(r.Context(), metricsContextKey, mctx)
+		r = r.WithContext(ctx)
+
+		// Wrap ResponseWriter to capture status code
+		wrapper := &responseWriterWrapper{
+			ResponseWriter: w,
+			statusCode:     http.StatusOK,
+			written:        false,
+		}
+
+		// Record metrics in defer to guarantee execution even on panic
+		defer func() {
+			// Update status code from wrapper
+			mctx.statusCode = wrapper.statusCode
+
+			// Record metrics exactly once
+			if !mctx.metricsWritten {
+				statusCodeStr := statusCodeToString(mctx.statusCode)
+				normalizedBackend := normalizeBackendLabel(mctx.backend)
+				retriedStr := boolToString(mctx.retried)
+
+				// Record request counter
+				proxyRequestsTotal.WithLabelValues(
+					mctx.subdomain,
+					normalizedBackend,
+					statusCodeStr,
+					mctx.kind,
+					retriedStr,
+				).Inc()
+
+				// Record total duration
+				totalDuration := time.Since(mctx.startTime).Seconds()
+				proxyRequestDuration.WithLabelValues(
+					mctx.subdomain,
+					normalizedBackend,
+					statusCodeStr,
+					mctx.kind,
+					retriedStr,
+				).Observe(totalDuration)
+
+				// Record backend duration if backend timing was set
+				if !mctx.backendStart.IsZero() {
+					backendDuration := time.Since(mctx.backendStart).Seconds()
+					proxyBackendDuration.WithLabelValues(
+						mctx.subdomain,
+						normalizedBackend,
+						statusCodeStr,
+						mctx.kind,
+						retriedStr,
+					).Observe(backendDuration)
+
+					// Record overhead (total - backend)
+					overhead := totalDuration - backendDuration
+					if overhead >= 0 {
+						proxyOverheadDuration.WithLabelValues(
+							mctx.subdomain,
+							normalizedBackend,
+							statusCodeStr,
+							mctx.kind,
+							retriedStr,
+						).Observe(overhead)
+					}
+				}
+
+				mctx.metricsWritten = true
+			}
+		}()
+
+		// Call the next handler
+		next.ServeHTTP(wrapper, r)
+	})
+}
+
+// extractSubdomainFromHost extracts the subdomain from a Host header
+// Examples: "eth.api.pocket.network" → "eth", "localhost:8080" → "localhost"
+func extractSubdomainFromHost(host string) string {
+	if host == "" {
+		return "unknown"
+	}
+
+	// Remove port if present
+	hostWithoutPort, _, err := net.SplitHostPort(host)
+	if err == nil {
+		host = hostWithoutPort
+	}
+
+	// Extract subdomain (first part)
+	parts := strings.Split(host, ".")
+	if len(parts) > 0 {
+		return parts[0]
+	}
+
+	return "unknown"
+}
+
 // Router multiplexes requests to appropriate handlers
 func (s *ProxyService) Router() http.Handler {
 	mux := http.NewServeMux()
@@ -1501,7 +1733,9 @@ func (s *ProxyService) Router() http.Handler {
 	mux.HandleFunc("/readyz", s.HandleReady)
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/", s.HandleProxy)
-	return mux
+
+	// Wrap with metrics middleware to guarantee metric recording for all requests
+	return metricsWrapper(mux)
 }
 
 // WatchConfigFile watches for changes to the CSV file and reloads
