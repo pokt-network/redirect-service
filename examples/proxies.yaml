@@ -110,3 +110,17 @@ services:
       - url: "http://localhost:8545"
         strip_path: false
         strip_query: false
+
+  # gRPC test service - Pocket Network Beta testnet
+  - name: grpc_test
+    backends:
+      - url: "https://grpc-seed-one-beta.infra.pocket.network"
+        strip_path: false
+        strip_query: false
+
+  # WebSocket test service - Pocket Network Beta testnet RPC
+  - name: ws_test
+    backends:
+      - url: "https://rpc-seed-one-beta.infra.pocket.network"
+        strip_path: false
+        strip_query: false

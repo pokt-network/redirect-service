@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -34,6 +35,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/robfig/cron/v3"
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 	"gopkg.in/yaml.v3"
 )
 
@@ -493,19 +495,43 @@ func normalizeBackendLabel(backendURL string) string {
 	return hostname
 }
 
-// getRequestKind determines the kind of request based on the URL path
-// Returns: "health", "ready", "metrics", or "rpc"
-func getRequestKind(path string) string {
-	switch path {
+// getRequestKind determines the kind of request based on the URL path and headers
+// Returns: "health", "ready", "metrics", "websocket", "grpc", or "rpc"
+func getRequestKind(r *http.Request) string {
+	// Check path-based kinds first
+	switch r.URL.Path {
 	case "/health", "/healthz":
 		return "health"
 	case "/ready", "/readyz":
 		return "ready"
 	case "/metrics":
 		return "metrics"
-	default:
-		return "rpc"
 	}
+
+	// Check for WebSocket upgrade
+	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		return "websocket"
+	}
+
+	// Check for gRPC
+	contentType := r.Header.Get("Content-Type")
+	if strings.HasPrefix(contentType, "application/grpc") {
+		return "grpc"
+	}
+
+	return "rpc"
+}
+
+// isStreamingRequest checks if the request is a streaming type (websocket or grpc)
+// These requests should bypass response buffering and retry logic
+func isStreamingRequest(r *http.Request) bool {
+	// WebSocket upgrade
+	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		return true
+	}
+
+	// gRPC (uses HTTP/2 streaming)
+	return strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc")
 }
 
 // boolToString converts a boolean to "true" or "false" string for metric labels
@@ -1248,10 +1274,10 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Check retry policy from the header (default: retry-all)
+	// Check retry policy from the header (default: fail-fast)
 	retryPolicy := r.Header.Get("Retry-Policy")
 	if retryPolicy == "" {
-		retryPolicy = "retry-all"
+		retryPolicy = "fail-fast"
 	} else {
 		retryPolicy = strings.ToLower(strings.TrimSpace(retryPolicy))
 	}
@@ -1265,6 +1291,15 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Streaming requests (WebSocket, gRPC) must use direct proxy - no buffering, no retry
+	// This ensures proper HTTP upgrade handling and streaming semantics
+	if isStreamingRequest(r) {
+		rule := lb.Next()
+		s.tryBackendDirect(w, r, subdomain, rule, start, host, clientIP)
+		return
+	}
+
+	// Retry-all with multiple backends: use buffered retry logic
 	if retryPolicy == "retry-all" && len(backends) > 1 {
 		triedURLs := make(map[string]bool) // Track which backends we've tried
 		attemptCount := 0
@@ -1309,9 +1344,10 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Default: fail-fast - use single backend via round-robin
+	// Default: fail-fast or single backend - use direct proxy (no buffering)
+	// This provides true zero-copy streaming for optimal performance
 	rule := lb.Next()
-	s.tryBackend(w, r, subdomain, rule, start, host, clientIP, true)
+	s.tryBackendDirect(w, r, subdomain, rule, start, host, clientIP)
 }
 
 // tryBackend attempts to proxy to a single backend
@@ -1430,6 +1466,56 @@ func (s *ProxyService) tryBackend(w http.ResponseWriter, r *http.Request, subdom
 	// Return success only if 2xx
 	success := rec.Code >= 200 && rec.Code < 300
 	return success, rec.Code, true
+}
+
+// tryBackendDirect proxies to a backend without response buffering
+// This is used for streaming requests (WebSocket, gRPC), fail-fast policy, and single backend scenarios
+// It provides true zero-copy streaming and supports HTTP upgrades
+func (s *ProxyService) tryBackendDirect(w http.ResponseWriter, r *http.Request, subdomain string, rule ProxyRule, start time.Time, host string, clientIP string) {
+	// Parse backend URL
+	targetURL, err := url.Parse(rule.ProxyTo)
+	if err != nil {
+		log.Printf("ERROR: Invalid proxy_to URL for subdomain '%s': %v", subdomain, err)
+		http.Error(w, "Internal Server Error: Invalid backend URL", http.StatusInternalServerError)
+		return
+	}
+
+	backend := targetURL.Host
+
+	// Store all metadata in the request context
+	ctx := context.WithValue(r.Context(), proxyMetadataField, proxyMetadata{
+		subdomain:     subdomain,
+		startTime:     start,
+		rule:          rule,
+		targetURL:     targetURL,
+		backend:       backend,
+		scheme:        targetURL.Scheme,
+		host:          host,
+		clientIP:      clientIP,
+		originalPath:  r.URL.Path,
+		originalQuery: r.URL.RawQuery,
+	})
+	r = r.WithContext(ctx)
+
+	// Update metricsContext with backend info
+	if mctx, ok := r.Context().Value(metricsContextKey).(*metricsContext); ok {
+		mctx.backend = backend
+	}
+
+	// Get or create a cached proxy for this backend
+	cacheKey := targetURL.Scheme + "://" + targetURL.Host
+	var proxy *httputil.ReverseProxy
+
+	if cached, ok := s.proxies.Load(cacheKey); ok {
+		proxy = cached.(*httputil.ReverseProxy)
+	} else {
+		// Create a new reverse proxy
+		proxy = s.createReverseProxy()
+		s.proxies.Store(cacheKey, proxy)
+	}
+
+	// Direct proxy - no buffering, supports streaming, WebSocket, gRPC
+	proxy.ServeHTTP(w, r)
 }
 
 // createReverseProxy creates a new httputil.ReverseProxy with custom Director, ModifyResponse, and ErrorHandler
@@ -1612,6 +1698,21 @@ func (rw *responseWriterWrapper) Write(b []byte) (int, error) {
 	return rw.ResponseWriter.Write(b)
 }
 
+// Hijack implements http.Hijacker interface for WebSocket support
+func (rw *responseWriterWrapper) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hijacker, ok := rw.ResponseWriter.(http.Hijacker); ok {
+		return hijacker.Hijack()
+	}
+	return nil, nil, fmt.Errorf("underlying ResponseWriter does not support hijacking")
+}
+
+// Flush implements http.Flusher interface for streaming support
+func (rw *responseWriterWrapper) Flush() {
+	if flusher, ok := rw.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
 // metricsWrapper wraps an HTTP handler to guarantee metrics recording for ALL requests
 // It creates a metricsContext that travels with the request, handlers populate it,
 // and the wrapper records metrics exactly once at the end via defer
@@ -1621,7 +1722,7 @@ func metricsWrapper(next http.Handler) http.Handler {
 		mctx := &metricsContext{
 			subdomain:      extractSubdomainFromHost(r.Host),
 			backend:        "unknown",
-			kind:           getRequestKind(r.URL.Path),
+			kind:           getRequestKind(r),
 			retried:        false,
 			startTime:      time.Now(),
 			statusCode:     http.StatusOK,
@@ -2003,9 +2104,14 @@ func main() {
 
 	// Configure HTTP server with VERY generous settings for streaming/long-running requests
 	// We don't control what backends or clients expect, so timeouts are minimal
+
+	// Wrap handler with h2c (HTTP/2 cleartext) support for gRPC
+	// This allows both HTTP/1.1 and HTTP/2 on the same port
+	h2cHandler := h2c.NewHandler(service.Router(), &http2.Server{})
+
 	server := &http.Server{
 		Addr:    ":" + port,
-		Handler: service.Router(),
+		Handler: h2cHandler,
 		// ReadTimeout covers: time to read request headers + body
 		// Set to 0 to support long-running uploads (e.g., large file uploads, streaming requests)
 		ReadTimeout: 0,
