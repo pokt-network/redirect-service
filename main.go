@@ -212,19 +212,22 @@ var (
 type RateLimitConfig struct {
 	Requests int           // Number of requests allowed
 	Window   time.Duration // Time window for rate limit
+	Message  string        // Custom rate limit exceeded message
 }
 
 // YAMLConfig YAML Configuration Structs
 type YAMLConfig struct {
-	Services []ServiceConfig `yaml:"services"`
+	RateLimitMessageDefault string          `yaml:"rate_limit_message_default,omitempty"`
+	Services                []ServiceConfig `yaml:"services"`
 }
 
 type ServiceConfig struct {
-	Name        string             `yaml:"name"`
-	RateLimit   string             `yaml:"rate_limit"`
-	HealthCheck *HealthCheckConfig `yaml:"health_check,omitempty"`
-	Backends    []BackendConfig    `yaml:"backends"`
-	Fallbacks   []BackendConfig    `yaml:"fallbacks,omitempty"`
+	Name             string             `yaml:"name"`
+	RateLimit        string             `yaml:"rate_limit"`
+	RateLimitMessage string             `yaml:"rate_limit_message,omitempty"`
+	HealthCheck      *HealthCheckConfig `yaml:"health_check,omitempty"`
+	Backends         []BackendConfig    `yaml:"backends"`
+	Fallbacks        []BackendConfig    `yaml:"fallbacks,omitempty"`
 }
 
 type BackendConfig struct {
@@ -260,22 +263,23 @@ type ProxyRule struct {
 }
 
 type ProxyService struct {
-	rules              atomic.Value // map[string][]ProxyRule - multiple backends per subdomain
-	configPath         string
-	loadTime           atomic.Value // time.Time
-	ruleCount          atomic.Int64
-	transport          *http.Transport
-	proxies            sync.Map                                           // map[string]*httputil.ReverseProxy - cached per backend
-	loadbalancers      *xsync.Map[string, *robin.Loadbalancer[ProxyRule]] // round-robin loadbalancer per subdomain
-	rateLimiter        *RateLimiter
-	rateLimitEnabled   bool
-	defaultRateLimit   *RateLimitConfig
-	trustProxy         bool
-	healthStates       *xsync.Map[string, *BackendHealth]     // Backend health status by URL
-	fallbackRules      *xsync.Map[string, []ProxyRule]        // Fallback backends per subdomain
-	healthCheckConfigs *xsync.Map[string, *HealthCheckConfig] // Health check config by subdomain
-	healthCheckPool    *pond.WorkerPool                       // Worker pool for health checks
-	healthCheckCron    *cron.Cron                             // Cron scheduler for health checks
+	rules                   atomic.Value // map[string][]ProxyRule - multiple backends per subdomain
+	configPath              string
+	loadTime                atomic.Value // time.Time
+	ruleCount               atomic.Int64
+	transport               *http.Transport
+	proxies                 sync.Map                                           // map[string]*httputil.ReverseProxy - cached per backend
+	loadbalancers           *xsync.Map[string, *robin.Loadbalancer[ProxyRule]] // round-robin loadbalancer per subdomain
+	rateLimiter             *RateLimiter
+	rateLimitEnabled        bool
+	defaultRateLimit        *RateLimitConfig
+	defaultRateLimitMessage string // Default rate limit message from YAML config
+	trustProxy              bool
+	healthStates            *xsync.Map[string, *BackendHealth]     // Backend health status by URL
+	fallbackRules           *xsync.Map[string, []ProxyRule]        // Fallback backends per subdomain
+	healthCheckConfigs      *xsync.Map[string, *HealthCheckConfig] // Health check config by subdomain
+	healthCheckPool         *pond.WorkerPool                       // Worker pool for health checks
+	healthCheckCron         *cron.Cron                             // Cron scheduler for health checks
 }
 
 type RateLimiter struct {
@@ -690,6 +694,9 @@ func (s *ProxyService) LoadRules() error {
 		return fmt.Errorf("no services defined in YAML")
 	}
 
+	// Store the default rate limit message from YAML (will hot-reload)
+	s.defaultRateLimitMessage = strings.TrimSpace(config.RateLimitMessageDefault)
+
 	newRules := make(map[string][]ProxyRule)
 	newFallbacks := xsync.NewMap[string, []ProxyRule]()
 	newHealthCheckConfigs := xsync.NewMap[string, *HealthCheckConfig]()
@@ -715,6 +722,10 @@ func (s *ProxyService) LoadRules() error {
 				log.Printf("WARN: Invalid rate_limit '%s' for service '%s': %v, using default", svc.RateLimit, subdomain, err)
 			} else {
 				rateLimit = parsed
+				// Add per-service custom rate limit message if specified
+				if svc.RateLimitMessage != "" {
+					rateLimit.Message = strings.TrimSpace(svc.RateLimitMessage)
+				}
 			}
 		}
 
@@ -1263,7 +1274,17 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 					}
 					w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 
-					http.Error(w, "Too Many Requests: Rate limit exceeded", http.StatusTooManyRequests)
+					// Determine which rate limit message to use (priority: per-service > global default > hardcoded)
+					message := "Too Many Requests: Rate limit exceeded"
+					if rateLimitConfig.Message != "" {
+						// Per-service custom message
+						message = rateLimitConfig.Message
+					} else if s.defaultRateLimitMessage != "" {
+						// Global default message from YAML
+						message = s.defaultRateLimitMessage
+					}
+
+					http.Error(w, message, http.StatusTooManyRequests)
 					return
 				}
 

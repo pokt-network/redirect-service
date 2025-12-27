@@ -6,6 +6,11 @@
 # - Rate limiting per service
 # - Custom headers and path/query manipulation
 
+# Global default rate limit message (optional)
+# This message will be returned when any service exceeds its rate limit,
+# unless the service has its own custom message defined
+rate_limit_message_default: "This public RPC channel is at capacity due to sustained high usage. To sponsor increased throughput, please contact directors@pokt.foundation"
+
 services:
   # Basic proxy with path and query stripping
   - name: httpbin_strip
@@ -58,9 +63,10 @@ services:
         strip_query: false
         extra_headers: '{"X-Custom-Backend": "backend-with-headers", "X-API-Key": "secret123"}'
 
-  # Service with strict rate limiting
+  # Service with strict rate limiting and custom message
   - name: rate_limited
     rate_limit: "10/1m"
+    rate_limit_message: "Custom rate limit message for this specific service"  # Optional: overrides global default
     backends:
       - url: "http://localhost:4040"
         strip_path: false
