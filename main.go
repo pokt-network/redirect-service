@@ -224,6 +224,7 @@ type YAMLConfig struct {
 type ServiceConfig struct {
 	Name             string             `yaml:"name"`
 	RateLimit        string             `yaml:"rate_limit"`
+	RateLimitGlobal  string             `yaml:"rate_limit_global,omitempty"`
 	RateLimitMessage string             `yaml:"rate_limit_message,omitempty"`
 	HealthCheck      *HealthCheckConfig `yaml:"health_check,omitempty"`
 	Backends         []BackendConfig    `yaml:"backends"`
@@ -258,7 +259,8 @@ type ProxyRule struct {
 	StripPath    bool
 	StripQuery   bool
 	ExtraHeaders map[string]string
-	RateLimit    *RateLimitConfig // Optional per-subdomain rate limit
+	RateLimit    *RateLimitConfig // Optional per-IP rate limit
+	GlobalLimit  *RateLimitConfig // Optional global rate limit (all IPs combined)
 	Weight       int              // Backend weight for load balancing (default: 1)
 }
 
@@ -714,7 +716,7 @@ func (s *ProxyService) LoadRules() error {
 			continue
 		}
 
-		// Parse rate limit
+		// Parse per-IP rate limit
 		var rateLimit *RateLimitConfig
 		if svc.RateLimit != "" {
 			parsed, err := parseRateLimit(svc.RateLimit)
@@ -729,10 +731,25 @@ func (s *ProxyService) LoadRules() error {
 			}
 		}
 
+		// Parse global rate limit (all IPs combined)
+		var globalLimit *RateLimitConfig
+		if svc.RateLimitGlobal != "" {
+			parsed, err := parseRateLimit(svc.RateLimitGlobal)
+			if err != nil {
+				log.Printf("WARN: Invalid rate_limit_global '%s' for service '%s': %v, skipping global limit", svc.RateLimitGlobal, subdomain, err)
+			} else {
+				globalLimit = parsed
+				// Global limit uses the same custom message as per-IP limit
+				if svc.RateLimitMessage != "" {
+					globalLimit.Message = strings.TrimSpace(svc.RateLimitMessage)
+				}
+			}
+		}
+
 		// Process primary backends with weight expansion
 		var backends []ProxyRule
 		for j, backend := range svc.Backends {
-			rule, err := s.parseBackendConfig(backend, rateLimit, j, false)
+			rule, err := s.parseBackendConfig(backend, rateLimit, globalLimit, j, false)
 			if err != nil {
 				log.Printf("WARN: Skipping backend %d for service '%s': %v", j, subdomain, err)
 				continue
@@ -770,7 +787,7 @@ func (s *ProxyService) LoadRules() error {
 		if len(svc.Fallbacks) > 0 {
 			var fallbacks []ProxyRule
 			for j, fallback := range svc.Fallbacks {
-				rule, err := s.parseBackendConfig(fallback, rateLimit, j, true)
+				rule, err := s.parseBackendConfig(fallback, rateLimit, globalLimit, j, true)
 				if err != nil {
 					log.Printf("WARN: Skipping fallback %d for service '%s': %v", j, subdomain, err)
 					continue
@@ -893,7 +910,7 @@ func (s *ProxyService) LoadRules() error {
 }
 
 // parseBackendConfig converts a BackendConfig to a ProxyRule
-func (s *ProxyService) parseBackendConfig(backend BackendConfig, rateLimit *RateLimitConfig, index int, isFallback bool) (ProxyRule, error) {
+func (s *ProxyService) parseBackendConfig(backend BackendConfig, rateLimit *RateLimitConfig, globalLimit *RateLimitConfig, index int, isFallback bool) (ProxyRule, error) {
 	backendType := "backend"
 	if isFallback {
 		backendType = "fallback"
@@ -925,6 +942,7 @@ func (s *ProxyService) parseBackendConfig(backend BackendConfig, rateLimit *Rate
 		StripQuery:   backend.StripQuery,
 		ExtraHeaders: extraHeaders,
 		RateLimit:    rateLimit,
+		GlobalLimit:  globalLimit,
 		Weight:       weight, // Store weight in ProxyRule
 	}, nil
 }
@@ -1236,7 +1254,54 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 
 	// Check rate limit if enabled
 	if s.rateLimitEnabled && s.rateLimiter != nil {
-		// Determine rate limit config (per-subdomain override or global default)
+		var globalRemaining int
+		var globalResetAt time.Time
+
+		// Check global rate limit first (all IPs combined for this service)
+		if len(backends) > 0 && backends[0].GlobalLimit != nil {
+			globalConfig := backends[0].GlobalLimit
+			allowed, remaining, resetAt, err := s.rateLimiter.CheckLimit(
+				r.Context(),
+				"global", // Use "global" as the "IP" to create a service-wide key
+				subdomain,
+				globalConfig.Requests,
+				globalConfig.Window,
+			)
+
+			globalRemaining = remaining
+			globalResetAt = resetAt
+
+			if err != nil {
+				// Redis error - log and fail open (allow request)
+				log.Printf("ERROR: Global rate limit check failed for subdomain %s: %v (failing open)", subdomain, err)
+				proxyRateLimitRedisErrorsTotal.Inc()
+			} else if !allowed {
+				// Global rate limit exceeded - return 429
+				proxyRateLimitRequestsTotal.WithLabelValues(subdomain, "blocked").Inc()
+
+				retryAfter := int(time.Until(resetAt).Seconds())
+				if retryAfter < 0 {
+					retryAfter = 0
+				}
+				w.Header().Set("X-RateLimit-Limit-Global", strconv.Itoa(globalConfig.Requests))
+				w.Header().Set("X-RateLimit-Remaining-Global", strconv.Itoa(remaining))
+				w.Header().Set("X-RateLimit-Reset-Global", strconv.FormatInt(resetAt.Unix(), 10))
+				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+
+				// Determine which rate limit message to use (priority: per-service > global default > hardcoded)
+				message := "Too Many Requests: Rate limit exceeded"
+				if globalConfig.Message != "" {
+					message = globalConfig.Message
+				} else if s.defaultRateLimitMessage != "" {
+					message = s.defaultRateLimitMessage
+				}
+
+				http.Error(w, message, http.StatusTooManyRequests)
+				return
+			}
+		}
+
+		// Check per-IP rate limit
 		var rateLimitConfig *RateLimitConfig
 		if len(backends) > 0 && backends[0].RateLimit != nil {
 			rateLimitConfig = backends[0].RateLimit
@@ -1258,13 +1323,20 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 				log.Printf("ERROR: Rate limit check failed for IP %s, subdomain %s: %v (failing open)", clientIP, subdomain, err)
 				proxyRateLimitRedisErrorsTotal.Inc()
 			} else {
-				// Add rate limit headers to response
+				// Add per-IP rate limit headers to response
 				w.Header().Set("X-RateLimit-Limit", strconv.Itoa(rateLimitConfig.Requests))
 				w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
 				w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(resetAt.Unix(), 10))
 
+				// Add global rate limit headers if global limit is configured
+				if len(backends) > 0 && backends[0].GlobalLimit != nil {
+					w.Header().Set("X-RateLimit-Limit-Global", strconv.Itoa(backends[0].GlobalLimit.Requests))
+					w.Header().Set("X-RateLimit-Remaining-Global", strconv.Itoa(globalRemaining))
+					w.Header().Set("X-RateLimit-Reset-Global", strconv.FormatInt(globalResetAt.Unix(), 10))
+				}
+
 				if !allowed {
-					// Rate limit exceeded - return 429
+					// Per-IP rate limit exceeded - return 429
 					proxyRateLimitRequestsTotal.WithLabelValues(subdomain, "blocked").Inc()
 					proxyRateLimitRemaining.WithLabelValues(subdomain).Set(float64(remaining))
 
