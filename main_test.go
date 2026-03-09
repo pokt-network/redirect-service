@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -445,6 +449,319 @@ func TestBug16_RetryPolicyServerSideOnly(t *testing.T) {
 	total := countA.Load() + countB.Load()
 	if total > 1 {
 		t.Errorf("Client Retry-Policy header was honored (hit %d backends). Should be ignored without server config.", total)
+	}
+}
+
+// === WebSocket & gRPC Tests ===
+
+// --- isStreamingRequest detection ---
+
+func TestIsStreamingRequest_WebSocket(t *testing.T) {
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Connection", "Upgrade")
+	if !isStreamingRequest(req) {
+		t.Error("WebSocket request not detected as streaming")
+	}
+}
+
+func TestIsStreamingRequest_WebSocketCaseInsensitive(t *testing.T) {
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("Upgrade", "WebSocket")
+	if !isStreamingRequest(req) {
+		t.Error("WebSocket detection should be case-insensitive")
+	}
+}
+
+func TestIsStreamingRequest_GRPC(t *testing.T) {
+	req := httptest.NewRequest("POST", "/service.Method", nil)
+	req.Header.Set("Content-Type", "application/grpc")
+	if !isStreamingRequest(req) {
+		t.Error("gRPC request not detected as streaming")
+	}
+}
+
+func TestIsStreamingRequest_GRPCProto(t *testing.T) {
+	req := httptest.NewRequest("POST", "/service.Method", nil)
+	req.Header.Set("Content-Type", "application/grpc+proto")
+	if !isStreamingRequest(req) {
+		t.Error("gRPC+proto request not detected as streaming")
+	}
+}
+
+func TestIsStreamingRequest_Normal(t *testing.T) {
+	req := httptest.NewRequest("GET", "/api/v1/data", nil)
+	if isStreamingRequest(req) {
+		t.Error("Normal HTTP request incorrectly detected as streaming")
+	}
+}
+
+// --- getRequestKind classification ---
+
+func TestGetRequestKind_WebSocket(t *testing.T) {
+	req := httptest.NewRequest("GET", "/ws", nil)
+	req.Header.Set("Upgrade", "websocket")
+	if kind := getRequestKind(req); kind != "websocket" {
+		t.Errorf("getRequestKind for WebSocket = %q, want %q", kind, "websocket")
+	}
+}
+
+func TestGetRequestKind_GRPC(t *testing.T) {
+	req := httptest.NewRequest("POST", "/service.Method", nil)
+	req.Header.Set("Content-Type", "application/grpc")
+	if kind := getRequestKind(req); kind != "grpc" {
+		t.Errorf("getRequestKind for gRPC = %q, want %q", kind, "grpc")
+	}
+}
+
+// --- WebSocket upgrade proxying ---
+
+func TestWebSocketUpgradeProxied(t *testing.T) {
+	// Create a backend that performs a WebSocket-like upgrade
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Upgrade") != "websocket" {
+			t.Error("Backend did not receive Upgrade: websocket header")
+			w.WriteHeader(400)
+			return
+		}
+		// Verify forwarding headers were set
+		if r.Header.Get("X-Forwarded-For") == "" {
+			t.Error("Backend missing X-Forwarded-For header")
+		}
+		// Perform the upgrade via hijack
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("Backend ResponseWriter does not support hijacking")
+			w.WriteHeader(500)
+			return
+		}
+		conn, bufrw, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("Backend hijack failed: %v", err)
+			return
+		}
+		defer conn.Close()
+		// Write a raw HTTP 101 response + echo message
+		bufrw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		bufrw.WriteString("hello from backend")
+		bufrw.Flush()
+	}))
+	t.Cleanup(backend.Close)
+
+	svc := newTestProxyService(t)
+	rules := map[string][]ProxyRule{
+		"ws": {{ProxyTo: backend.URL, Weight: 1}},
+	}
+	injectRules(svc, rules)
+
+	router := svc.Router()
+	// Use a real TCP server so we can hijack
+	frontendSrv := httptest.NewServer(router)
+	t.Cleanup(frontendSrv.Close)
+
+	// Connect via raw TCP to the frontend
+	conn, err := net.Dial("tcp", strings.TrimPrefix(frontendSrv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("Failed to connect to frontend: %v", err)
+	}
+	defer conn.Close()
+
+	// Send WebSocket upgrade request
+	reqStr := "GET / HTTP/1.1\r\n" +
+		"Host: ws.api.pocket.network\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"\r\n"
+	if _, err := conn.Write([]byte(reqStr)); err != nil {
+		t.Fatalf("Failed to write request: %v", err)
+	}
+
+	// Read response
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatalf("Failed to read response: %v", err)
+	}
+
+	if resp.StatusCode != 101 {
+		t.Errorf("Expected 101 Switching Protocols, got %d", resp.StatusCode)
+	}
+	if resp.Header.Get("Upgrade") != "websocket" {
+		t.Errorf("Expected Upgrade: websocket header in response, got %q", resp.Header.Get("Upgrade"))
+	}
+
+	// Read the echoed message from the hijacked connection
+	buf := make([]byte, 256)
+	n, err := reader.Read(buf)
+	if err != nil && err != io.EOF {
+		t.Fatalf("Failed to read message: %v", err)
+	}
+	msg := string(buf[:n])
+	if msg != "hello from backend" {
+		t.Errorf("Expected 'hello from backend', got %q", msg)
+	}
+}
+
+// --- WebSocket bypasses retry-all ---
+
+func TestWebSocketBypassesRetryAll(t *testing.T) {
+	backendA, countA := newTestBackend(t, 503)
+	backendB, countB := newTestBackend(t, 200)
+
+	svc := newTestProxyService(t)
+	rules := map[string][]ProxyRule{
+		"ws": {
+			{ProxyTo: backendA.URL, Weight: 1, RetryPolicy: "retry-all"},
+			{ProxyTo: backendB.URL, Weight: 1, RetryPolicy: "retry-all"},
+		},
+	}
+	injectRules(svc, rules)
+
+	router := svc.Router()
+
+	// WebSocket request should go direct (no retry), hitting only one backend
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Host = "ws.api.pocket.network"
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Connection", "Upgrade")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	total := countA.Load() + countB.Load()
+	if total != 1 {
+		t.Errorf("WebSocket should hit exactly 1 backend (no retry), got %d", total)
+	}
+}
+
+// --- gRPC bypasses retry-all ---
+
+func TestGRPCBypassesRetryAll(t *testing.T) {
+	backendA, countA := newTestBackend(t, 503)
+	backendB, countB := newTestBackend(t, 200)
+
+	svc := newTestProxyService(t)
+	rules := map[string][]ProxyRule{
+		"grpc": {
+			{ProxyTo: backendA.URL, Weight: 1, RetryPolicy: "retry-all"},
+			{ProxyTo: backendB.URL, Weight: 1, RetryPolicy: "retry-all"},
+		},
+	}
+	injectRules(svc, rules)
+
+	router := svc.Router()
+
+	// gRPC request should go direct (no retry), hitting only one backend
+	req := httptest.NewRequest("POST", "/service.Method", nil)
+	req.Host = "grpc.api.pocket.network"
+	req.Header.Set("Content-Type", "application/grpc")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	total := countA.Load() + countB.Load()
+	if total != 1 {
+		t.Errorf("gRPC should hit exactly 1 backend (no retry), got %d", total)
+	}
+}
+
+// --- gRPC content-type forwarded to backend ---
+
+func TestGRPCContentTypeForwarded(t *testing.T) {
+	var receivedContentType string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedContentType = r.Header.Get("Content-Type")
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(backend.Close)
+
+	svc := newTestProxyService(t)
+	rules := map[string][]ProxyRule{
+		"grpc": {{ProxyTo: backend.URL, Weight: 1}},
+	}
+	injectRules(svc, rules)
+
+	router := svc.Router()
+
+	req := httptest.NewRequest("POST", "/pkg.Service/Method", nil)
+	req.Host = "grpc.api.pocket.network"
+	req.Header.Set("Content-Type", "application/grpc+proto")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if receivedContentType != "application/grpc+proto" {
+		t.Errorf("Backend received Content-Type %q, want %q", receivedContentType, "application/grpc+proto")
+	}
+}
+
+// --- WebSocket extra headers preserved ---
+
+func TestWebSocketExtraHeadersPreserved(t *testing.T) {
+	var receivedHeaders http.Header
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header.Clone()
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(backend.Close)
+
+	svc := newTestProxyService(t)
+	rules := map[string][]ProxyRule{
+		"ws": {{
+			ProxyTo: backend.URL,
+			Weight:  1,
+			ExtraHeaders: map[string]string{
+				"X-Api-Key": "secret-key",
+			},
+		}},
+	}
+	injectRules(svc, rules)
+
+	router := svc.Router()
+
+	req := httptest.NewRequest("GET", "/ws", nil)
+	req.Host = "ws.api.pocket.network"
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Connection", "Upgrade")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if receivedHeaders.Get("X-Api-Key") != "secret-key" {
+		t.Errorf("Extra header X-Api-Key not forwarded to backend, got %q", receivedHeaders.Get("X-Api-Key"))
+	}
+	if receivedHeaders.Get("Upgrade") != "websocket" {
+		t.Errorf("Upgrade header not forwarded to backend, got %q", receivedHeaders.Get("Upgrade"))
+	}
+}
+
+// --- Rewrite API: headers can't be stripped by hop-by-hop ---
+
+func TestRewriteAPIHeaderSafety(t *testing.T) {
+	var receivedHeaders http.Header
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedHeaders = r.Header.Clone()
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(backend.Close)
+
+	svc := newTestProxyService(t)
+	rules := map[string][]ProxyRule{
+		"test": {{ProxyTo: backend.URL, Weight: 1}},
+	}
+	injectRules(svc, rules)
+
+	router := svc.Router()
+
+	// Client tries to strip X-Forwarded-For via hop-by-hop Connection header
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Host = "test.api.pocket.network"
+	req.Header.Set("Connection", "X-Forwarded-For")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	// With Rewrite API, X-Forwarded-For should still be present at the backend
+	if receivedHeaders.Get("X-Forwarded-For") == "" {
+		t.Error("X-Forwarded-For was stripped by hop-by-hop Connection header — Rewrite API should prevent this")
 	}
 }
 

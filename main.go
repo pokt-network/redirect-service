@@ -1705,80 +1705,81 @@ func (s *ProxyService) tryBackendDirect(w http.ResponseWriter, r *http.Request, 
 	proxy.ServeHTTP(w, r)
 }
 
-// createReverseProxy creates a new httputil.ReverseProxy with custom Director, ModifyResponse, and ErrorHandler
+// createReverseProxy creates a new httputil.ReverseProxy with Rewrite, ModifyResponse, and ErrorHandler.
+// Uses Rewrite (not Director) to prevent clients from stripping proxy-set headers via hop-by-hop designation.
 func (s *ProxyService) createReverseProxy() *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
+		Rewrite: func(pr *httputil.ProxyRequest) {
 			// Get metadata from context
-			meta, ok := req.Context().Value(proxyMetadataField).(proxyMetadata)
+			meta, ok := pr.In.Context().Value(proxyMetadataField).(proxyMetadata)
 			if !ok {
 				return
 			}
 
 			// Record backend start time (after Taiji routing/header processing, before sending to backend)
-			ctx := context.WithValue(req.Context(), backendStartTimeField, time.Now())
-			*req = *req.WithContext(ctx)
+			ctx := context.WithValue(pr.Out.Context(), backendStartTimeField, time.Now())
+			pr.Out = pr.Out.WithContext(ctx)
 
 			// Set backend URL
-			req.URL.Scheme = meta.targetURL.Scheme
-			req.URL.Host = meta.targetURL.Host
+			pr.Out.URL.Scheme = meta.targetURL.Scheme
+			pr.Out.URL.Host = meta.targetURL.Host
 
 			// Set Host header - check if the custom Host is in extra_headers first
 			if customHost, hasCustomHost := meta.rule.ExtraHeaders["Host"]; hasCustomHost {
-				req.Host = customHost
+				pr.Out.Host = customHost
 			} else {
-				req.Host = meta.targetURL.Host
+				pr.Out.Host = meta.targetURL.Host
 			}
 
 			// Handle path
 			if meta.rule.StripPath {
-				req.URL.Path = meta.targetURL.Path
+				pr.Out.URL.Path = meta.targetURL.Path
 			} else {
 				if meta.targetURL.Path != "" {
-					req.URL.Path = singleJoiningSlash(meta.targetURL.Path, meta.originalPath)
+					pr.Out.URL.Path = singleJoiningSlash(meta.targetURL.Path, meta.originalPath)
 				} else {
-					req.URL.Path = meta.originalPath
+					pr.Out.URL.Path = meta.originalPath
 				}
 			}
 
 			// Handle query string
 			if meta.rule.StripQuery {
-				req.URL.RawQuery = ""
+				pr.Out.URL.RawQuery = ""
 			} else if meta.targetURL.RawQuery != "" {
 				if meta.originalQuery != "" {
-					req.URL.RawQuery = meta.targetURL.RawQuery + "&" + meta.originalQuery
+					pr.Out.URL.RawQuery = meta.targetURL.RawQuery + "&" + meta.originalQuery
 				} else {
-					req.URL.RawQuery = meta.targetURL.RawQuery
+					pr.Out.URL.RawQuery = meta.targetURL.RawQuery
 				}
 			} else {
-				req.URL.RawQuery = meta.originalQuery
+				pr.Out.URL.RawQuery = meta.originalQuery
 			}
 
 			// Apply extra headers from backend config (except Host which was already set)
 			for k, v := range meta.rule.ExtraHeaders {
 				if k == "Host" {
-					// Host was already set via req.Host above
 					continue
 				}
-				req.Header.Set(k, v)
+				pr.Out.Header.Set(k, v)
 			}
 
 			// Add X-Forwarded-* headers (legacy, but widely supported)
-			if prior, ok := req.Header["X-Forwarded-For"]; ok {
-				req.Header.Set("X-Forwarded-For", strings.Join(prior, ", ")+", "+meta.clientIP)
+			// Rewrite does not auto-set X-Forwarded-For like Director, so we manage it ourselves.
+			if prior, ok := pr.In.Header["X-Forwarded-For"]; ok {
+				pr.Out.Header.Set("X-Forwarded-For", strings.Join(prior, ", ")+", "+meta.clientIP)
 			} else {
-				req.Header.Set("X-Forwarded-For", meta.clientIP)
+				pr.Out.Header.Set("X-Forwarded-For", meta.clientIP)
 			}
-			req.Header.Set("X-Real-IP", meta.clientIP)
-			req.Header.Set("X-Forwarded-Proto", meta.scheme)
-			req.Header.Set("X-Forwarded-Host", meta.host)
+			pr.Out.Header.Set("X-Real-IP", meta.clientIP)
+			pr.Out.Header.Set("X-Forwarded-Proto", meta.scheme)
+			pr.Out.Header.Set("X-Forwarded-Host", meta.host)
 
 			// Add standard Forwarded header (RFC 7239)
 			forwardedValue := "for=" + meta.clientIP + ";host=" + meta.host + ";proto=" + meta.scheme
-			if prior, ok := req.Header["Forwarded"]; ok {
-				req.Header.Set("Forwarded", strings.Join(prior, ", ")+", "+forwardedValue)
+			if prior, ok := pr.In.Header["Forwarded"]; ok {
+				pr.Out.Header.Set("Forwarded", strings.Join(prior, ", ")+", "+forwardedValue)
 			} else {
-				req.Header.Set("Forwarded", forwardedValue)
+				pr.Out.Header.Set("Forwarded", forwardedValue)
 			}
 		},
 		Transport:  s.transport,
