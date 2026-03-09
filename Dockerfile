@@ -40,9 +40,9 @@ USER nonroot:nonroot
 # Expose HTTP port
 EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["/app/taiji"]
+# Health check: distroless has no shell/curl, so rely on orchestrator HTTP probes instead.
+# Kubernetes example: httpGet: {path: "/_health", port: 8080}
+# Docker Compose example: test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/_health || exit 1"]
 
 # Run the service
 ENTRYPOINT ["/app/taiji"]

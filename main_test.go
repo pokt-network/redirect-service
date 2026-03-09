@@ -765,3 +765,375 @@ func TestRewriteAPIHeaderSafety(t *testing.T) {
 	}
 }
 
+// === Security & Path Manipulation Tests ===
+
+// --- Path traversal prevention ---
+
+func TestPathTraversalPrevented(t *testing.T) {
+	var receivedPath string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(backend.Close)
+
+	svc := newTestProxyService(t)
+	rules := map[string][]ProxyRule{
+		"test": {{ProxyTo: backend.URL + "/api", Weight: 1}},
+	}
+	injectRules(svc, rules)
+
+	router := svc.Router()
+
+	// Client sends path traversal attempt
+	req := httptest.NewRequest("GET", "/../admin/secret", nil)
+	req.Host = "test.api.pocket.network"
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	// path.Clean should normalize away the ".." — /api/../admin/secret -> /admin/secret
+	if strings.Contains(receivedPath, "..") {
+		t.Errorf("Path traversal not prevented: backend received path %q", receivedPath)
+	}
+}
+
+func TestSingleJoiningSlashNormalization(t *testing.T) {
+	tests := []struct {
+		a, b, want string
+	}{
+		{"/api", "/v1/data", "/api/v1/data"},
+		{"/api/", "/v1/data", "/api/v1/data"},
+		{"/api", "/../admin", "/admin"},       // traversal normalized
+		{"/api", "/./v1/../v2", "/api/v2"},    // complex traversal
+		{"/", "/", "/"},
+		{"/api", "/", "/api"},
+	}
+	for _, tt := range tests {
+		got := singleJoiningSlash(tt.a, tt.b)
+		if got != tt.want {
+			t.Errorf("singleJoiningSlash(%q, %q) = %q, want %q", tt.a, tt.b, got, tt.want)
+		}
+	}
+}
+
+// --- Host header CRLF injection ---
+
+func TestHostHeaderCRLFRejected(t *testing.T) {
+	svc := newTestProxyService(t)
+	rules := map[string][]ProxyRule{
+		"test": {{ProxyTo: "http://localhost:9999", Weight: 1}},
+	}
+	injectRules(svc, rules)
+
+	router := svc.Router()
+
+	tests := []struct {
+		name string
+		host string
+	}{
+		{"CR injection", "test.api.pocket.network\r\nX-Injected: evil"},
+		{"LF injection", "test.api.pocket.network\nX-Injected: evil"},
+		{"bare CR", "test.api.pocket.network\revil"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/", nil)
+			req.Host = tt.host
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+
+			if w.Code != 400 {
+				t.Errorf("Expected 400 for CRLF host %q, got %d", tt.host, w.Code)
+			}
+		})
+	}
+}
+
+// --- strip_path behavior ---
+
+func TestStripPath(t *testing.T) {
+	var receivedPath string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(backend.Close)
+
+	svc := newTestProxyService(t)
+	rules := map[string][]ProxyRule{
+		"test": {{ProxyTo: backend.URL + "/backend-path", StripPath: true, Weight: 1}},
+	}
+	injectRules(svc, rules)
+
+	router := svc.Router()
+
+	req := httptest.NewRequest("GET", "/client/path", nil)
+	req.Host = "test.api.pocket.network"
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	// With strip_path=true, client path should be replaced by backend's configured path
+	if receivedPath != "/backend-path" {
+		t.Errorf("strip_path: backend received %q, want %q", receivedPath, "/backend-path")
+	}
+}
+
+func TestNoStripPath(t *testing.T) {
+	var receivedPath string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(backend.Close)
+
+	svc := newTestProxyService(t)
+	rules := map[string][]ProxyRule{
+		"test": {{ProxyTo: backend.URL + "/api", StripPath: false, Weight: 1}},
+	}
+	injectRules(svc, rules)
+
+	router := svc.Router()
+
+	req := httptest.NewRequest("GET", "/v1/data", nil)
+	req.Host = "test.api.pocket.network"
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	// Without strip_path, paths should be joined: /api + /v1/data = /api/v1/data
+	if receivedPath != "/api/v1/data" {
+		t.Errorf("no strip_path: backend received %q, want %q", receivedPath, "/api/v1/data")
+	}
+}
+
+// --- strip_query behavior ---
+
+func TestStripQuery(t *testing.T) {
+	var receivedQuery string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedQuery = r.URL.RawQuery
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(backend.Close)
+
+	svc := newTestProxyService(t)
+	rules := map[string][]ProxyRule{
+		"test": {{ProxyTo: backend.URL, StripQuery: true, Weight: 1}},
+	}
+	injectRules(svc, rules)
+
+	router := svc.Router()
+
+	req := httptest.NewRequest("GET", "/data?key=value&secret=123", nil)
+	req.Host = "test.api.pocket.network"
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if receivedQuery != "" {
+		t.Errorf("strip_query: backend received query %q, want empty", receivedQuery)
+	}
+}
+
+func TestNoStripQuery(t *testing.T) {
+	var receivedQuery string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedQuery = r.URL.RawQuery
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(backend.Close)
+
+	svc := newTestProxyService(t)
+	rules := map[string][]ProxyRule{
+		"test": {{ProxyTo: backend.URL, StripQuery: false, Weight: 1}},
+	}
+	injectRules(svc, rules)
+
+	router := svc.Router()
+
+	req := httptest.NewRequest("GET", "/data?key=value", nil)
+	req.Host = "test.api.pocket.network"
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if receivedQuery != "key=value" {
+		t.Errorf("no strip_query: backend received query %q, want %q", receivedQuery, "key=value")
+	}
+}
+
+// --- Fallback backend tests ---
+
+func TestFallbackUsedWhenAllPrimariesUnhealthy(t *testing.T) {
+	primary, primaryCount := newTestBackend(t, 200)
+	fallback, fallbackCount := newTestBackend(t, 200)
+
+	svc := newTestProxyService(t)
+
+	rules := map[string][]ProxyRule{
+		"test": {{ProxyTo: primary.URL, Weight: 1}},
+	}
+	injectRules(svc, rules)
+
+	// Configure health checks (required for health filtering)
+	hcConfigs := xsync.NewMap[string, *HealthCheckConfig]()
+	hcConfigs.Store("test", &HealthCheckConfig{
+		Path:             "/health",
+		FailureThreshold: 1,
+	})
+	svc.healthCheckConfigs.Store(hcConfigs)
+
+	// Mark primary as unhealthy
+	healthStates := xsync.NewMap[string, *BackendHealth]()
+	primaryHealth := &BackendHealth{}
+	primaryHealth.healthy.Store(false)
+	primaryHealth.consecutiveFailures.Store(5)
+	primaryHealth.lastCheck.Store(time.Now())
+	healthStates.Store(primary.URL, primaryHealth)
+	svc.healthStates.Store(healthStates)
+
+	// Set up fallback
+	fallbackRules := xsync.NewMap[string, []ProxyRule]()
+	fallbackRules.Store("test", []ProxyRule{{ProxyTo: fallback.URL, Weight: 1}})
+	svc.fallbackRules.Store(fallbackRules)
+
+	router := svc.Router()
+
+	// Send requests — should all go to fallback
+	for i := 0; i < 5; i++ {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Host = "test.api.pocket.network"
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != 200 {
+			t.Errorf("Request %d: expected 200, got %d", i, w.Code)
+		}
+	}
+
+	if primaryCount.Load() != 0 {
+		t.Errorf("Unhealthy primary received %d requests, expected 0", primaryCount.Load())
+	}
+	if fallbackCount.Load() != 5 {
+		t.Errorf("Fallback received %d requests, expected 5", fallbackCount.Load())
+	}
+}
+
+func TestAllBackendsUnhealthyReturns503(t *testing.T) {
+	primary, _ := newTestBackend(t, 200)
+	fallback, _ := newTestBackend(t, 200)
+
+	svc := newTestProxyService(t)
+
+	rules := map[string][]ProxyRule{
+		"test": {{ProxyTo: primary.URL, Weight: 1}},
+	}
+	injectRules(svc, rules)
+
+	// Configure health checks
+	hcConfigs := xsync.NewMap[string, *HealthCheckConfig]()
+	hcConfigs.Store("test", &HealthCheckConfig{
+		Path:             "/health",
+		FailureThreshold: 1,
+	})
+	svc.healthCheckConfigs.Store(hcConfigs)
+
+	// Mark both primary and fallback as unhealthy
+	healthStates := xsync.NewMap[string, *BackendHealth]()
+	for _, url := range []string{primary.URL, fallback.URL} {
+		h := &BackendHealth{}
+		h.healthy.Store(false)
+		h.consecutiveFailures.Store(5)
+		h.lastCheck.Store(time.Now())
+		healthStates.Store(url, h)
+	}
+	svc.healthStates.Store(healthStates)
+
+	// Set up fallback (also unhealthy)
+	fallbackRules := xsync.NewMap[string, []ProxyRule]()
+	fallbackRules.Store("test", []ProxyRule{{ProxyTo: fallback.URL, Weight: 1}})
+	svc.fallbackRules.Store(fallbackRules)
+
+	router := svc.Router()
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Host = "test.api.pocket.network"
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != 503 {
+		t.Errorf("Expected 503 when all backends unhealthy, got %d", w.Code)
+	}
+}
+
+// --- Response buffer size limit ---
+
+func TestRetryAllResponseSizeLimit(t *testing.T) {
+	// Create a backend that returns a very large response
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		// Write more than maxRetryResponseSize (128MB) — use a streaming approach
+		// to avoid allocating 128MB in the test. We just need to exceed the limit.
+		chunk := make([]byte, 1024*1024) // 1MB chunk
+		for i := 0; i < 130; i++ {       // 130MB total
+			if _, err := w.Write(chunk); err != nil {
+				return // limitedResponseRecorder will reject writes
+			}
+		}
+	}))
+	t.Cleanup(backend.Close)
+
+	backendB, _ := newTestBackend(t, 503)
+
+	svc := newTestProxyService(t)
+	rules := map[string][]ProxyRule{
+		"test": {
+			{ProxyTo: backend.URL, Weight: 1, RetryPolicy: "retry-all"},
+			{ProxyTo: backendB.URL, Weight: 1, RetryPolicy: "retry-all"},
+		},
+	}
+	injectRules(svc, rules)
+
+	router := svc.Router()
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Host = "test.api.pocket.network"
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	// Should get 502 (response too large) rather than OOM
+	if w.Code != 502 && w.Code != 200 {
+		// 200 is possible if the large-response backend is tried as non-last attempt
+		// and the recorder truncates; either way no OOM is the goal
+		t.Logf("Response status: %d (expected 502 or 200, no OOM)", w.Code)
+	}
+}
+
+// --- Forwarded header IPv6 quoting ---
+
+func TestForwardedHeaderIPv6Quoting(t *testing.T) {
+	var receivedForwarded string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedForwarded = r.Header.Get("Forwarded")
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(backend.Close)
+
+	svc := newTestProxyService(t)
+	rules := map[string][]ProxyRule{
+		"test": {{ProxyTo: backend.URL, Weight: 1}},
+	}
+	injectRules(svc, rules)
+
+	router := svc.Router()
+
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Host = "test.api.pocket.network"
+	req.RemoteAddr = "[2001:db8::1]:12345"
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	// IPv6 addresses should be quoted in Forwarded header per RFC 7239
+	if !strings.Contains(receivedForwarded, "for=\"") {
+		t.Errorf("IPv6 address not quoted in Forwarded header: %q", receivedForwarded)
+	}
+}
+

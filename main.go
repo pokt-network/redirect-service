@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -48,6 +49,10 @@ const (
 	proxyMetadataField    = contextKey("proxy_metadata")
 	backendStartTimeField = contextKey("backend_start_time")
 	metricsContextKey     = contextKey("metrics_context")
+
+	// maxRetryResponseSize is the maximum response body size (128MB) that will be
+	// buffered during retry-all mode. Prevents OOM from malicious/misconfigured backends.
+	maxRetryResponseSize = 128 << 20
 )
 
 // Pre-compiled regex for Forwarded header parsing (avoid compiling per request)
@@ -96,6 +101,38 @@ func (bp *BufferPool) Get() []byte {
 // Put returns a buffer to the pool for reuse
 func (bp *BufferPool) Put(buf []byte) {
 	bp.pool.Put(buf) //nolint:staticcheck // SA6002: slices are pointer-like, and this is the idiomatic way to use sync.Pool with byte slices
+}
+
+// errResponseTooLarge is returned when a backend response exceeds maxRetryResponseSize during retry-all buffering.
+var errResponseTooLarge = errors.New("response body exceeds maximum retry buffer size")
+
+// limitedResponseRecorder wraps httptest.ResponseRecorder with a body size limit
+// to prevent OOM from large backend responses during retry-all buffering.
+type limitedResponseRecorder struct {
+	*httptest.ResponseRecorder
+	maxSize   int64
+	written   int64
+	truncated bool
+}
+
+func newLimitedResponseRecorder(maxSize int64) *limitedResponseRecorder {
+	return &limitedResponseRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		maxSize:          maxSize,
+	}
+}
+
+func (lr *limitedResponseRecorder) Write(b []byte) (int, error) {
+	if lr.truncated {
+		return 0, errResponseTooLarge
+	}
+	if lr.written+int64(len(b)) > lr.maxSize {
+		lr.truncated = true
+		return 0, errResponseTooLarge
+	}
+	n, err := lr.ResponseRecorder.Write(b)
+	lr.written += int64(n)
+	return n, err
 }
 
 var (
@@ -1298,8 +1335,13 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	// Extract subdomain from Host header
 	host := r.Host
 	if host == "" {
-		// Wrapper will record metrics with subdomain="unknown", backend="unknown", status=400
 		http.Error(w, "Bad Request: Missing Host header", http.StatusBadRequest)
+		return
+	}
+
+	// Reject CRLF in Host header to prevent header injection in forwarding headers
+	if strings.ContainsAny(host, "\r\n") {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
 
@@ -1601,8 +1643,15 @@ func (s *ProxyService) tryBackend(w http.ResponseWriter, r *http.Request, subdom
 
 	// For retry-all on non-last attempts, we need to capture the response to check status
 	if !isLastAttempt {
-		rec := httptest.NewRecorder()
+		rec := newLimitedResponseRecorder(maxRetryResponseSize)
 		proxy.ServeHTTP(rec, r)
+
+		// If response was too large, treat as non-retryable error
+		if rec.truncated {
+			log.Printf("WARN: Backend %s response too large for retry buffer for subdomain '%s', returning 502", backend, subdomain)
+			http.Error(w, "Bad Gateway: Backend response too large", http.StatusBadGateway)
+			return false, 502, true
+		}
 
 		// Check if successful (2xx status)
 		if rec.Code >= 200 && rec.Code < 300 {
@@ -1644,9 +1693,16 @@ func (s *ProxyService) tryBackend(w http.ResponseWriter, r *http.Request, subdom
 		return false, rec.Code, false
 	}
 
-	// Last attempt or fail-fast: use recorder to capture status code
-	rec := httptest.NewRecorder()
+	// Last attempt or fail-fast: use limited recorder to capture status code
+	rec := newLimitedResponseRecorder(maxRetryResponseSize)
 	proxy.ServeHTTP(rec, r)
+
+	// If response was too large, return 502
+	if rec.truncated {
+		log.Printf("WARN: Backend %s response too large for retry buffer for subdomain '%s', returning 502", backend, subdomain)
+		http.Error(w, "Bad Gateway: Backend response too large", http.StatusBadGateway)
+		return false, 502, true
+	}
 
 	// Copy to a real response writer
 	for k, v := range rec.Header() {
@@ -1775,7 +1831,16 @@ func (s *ProxyService) createReverseProxy() *httputil.ReverseProxy {
 			pr.Out.Header.Set("X-Forwarded-Host", meta.host)
 
 			// Add standard Forwarded header (RFC 7239)
-			forwardedValue := "for=" + meta.clientIP + ";host=" + meta.host + ";proto=" + meta.scheme
+			// Quote values containing colons (IPv6) or special characters per RFC 7239 §4
+			forIP := meta.clientIP
+			if strings.Contains(forIP, ":") {
+				forIP = "\"" + forIP + "\""
+			}
+			forHost := meta.host
+			if strings.Contains(forHost, ":") {
+				forHost = "\"" + forHost + "\""
+			}
+			forwardedValue := "for=" + forIP + ";host=" + forHost + ";proto=" + meta.scheme
 			if prior, ok := pr.In.Header["Forwarded"]; ok {
 				pr.Out.Header.Set("Forwarded", strings.Join(prior, ", ")+", "+forwardedValue)
 			} else {
@@ -1822,17 +1887,21 @@ func (s *ProxyService) createReverseProxy() *httputil.ReverseProxy {
 	}
 }
 
-// singleJoiningSlash joins two URL paths with a single slash
+// singleJoiningSlash joins two URL paths with a single slash and normalizes
+// the result with path.Clean to prevent path traversal via ".." sequences.
 func singleJoiningSlash(a, b string) string {
 	aSlash := strings.HasSuffix(a, "/")
 	bSlash := strings.HasPrefix(b, "/")
+	var joined string
 	switch {
 	case aSlash && bSlash:
-		return a + b[1:]
+		joined = a + b[1:]
 	case !aSlash && !bSlash:
-		return a + "/" + b
+		joined = a + "/" + b
+	default:
+		joined = a + b
 	}
-	return a + b
+	return path.Clean(joined)
 }
 
 // countUniqueBackends counts the number of unique backend URLs in a slice
