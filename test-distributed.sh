@@ -60,11 +60,11 @@ echo ""
 # Check metrics from both instances
 echo "[4/4] Checking Prometheus metrics..."
 echo "  taiji-1 metrics:"
-docker exec taiji-1 wget -q -O- http://localhost:8080/metrics 2>/dev/null | \
+docker exec taiji-1 wget -q -O- http://localhost:8080/_metrics 2>/dev/null | \
     grep "proxy_ratelimit_requests_total" | head -2 | sed 's/^/    /'
 
 echo "  taiji-2 metrics:"
-docker exec taiji-2 wget -q -O- http://localhost:8080/metrics 2>/dev/null | \
+docker exec taiji-2 wget -q -O- http://localhost:8080/_metrics 2>/dev/null | \
     grep "proxy_ratelimit_requests_total" | head -2 | sed 's/^/    /'
 echo ""
 

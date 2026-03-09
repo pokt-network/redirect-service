@@ -16,7 +16,7 @@ NC='\033[0m' # No Color
 check_health() {
     local subdomain=$1
     local backend=$2
-    curl -s http://localhost:8080/metrics | grep "proxy_backend_health_status{backend=\"${backend}\",subdomain=\"${subdomain}\"}" | awk '{print $2}'
+    curl -s http://localhost:8080/_metrics | grep "proxy_backend_health_status{backend=\"${backend}\",subdomain=\"${subdomain}\"}" | awk '{print $2}'
 }
 
 test_request() {
@@ -82,7 +82,7 @@ test_request "test_health_fallback"
 echo ""
 echo "📊 Step 5: Check fallback metrics"
 echo "────────────────────────────────────────────────────────────────"
-curl -s http://localhost:8080/metrics | grep -E "proxy_fallback|proxy_all_backends_unhealthy"
+curl -s http://localhost:8080/_metrics | grep -E "proxy_fallback|proxy_all_backends_unhealthy"
 
 echo ""
 echo "♻️  Step 6: Restart httpbin1 and verify recovery"

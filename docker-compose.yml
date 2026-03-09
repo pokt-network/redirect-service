@@ -38,7 +38,7 @@ services:
       - httpbin1
       - httpbin2
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8080/health"]
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8080/_health"]
       interval: 10s
       timeout: 3s
       retries: 3
@@ -63,7 +63,7 @@ services:
       - httpbin1
       - httpbin2
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8080/health"]
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8080/_health"]
       interval: 10s
       timeout: 3s
       retries: 3

@@ -14,7 +14,7 @@ ENDPOINT="${1:-http://localhost:8080}"
 
 # Test health endpoint
 echo -e "${YELLOW}[TEST] Health check${NC}"
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT/health")
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT/_health")
 if [ "$HTTP_CODE" == "200" ]; then
     echo -e "${GREEN}✓ Health check passed (HTTP $HTTP_CODE)${NC}\n"
 else
@@ -24,7 +24,7 @@ fi
 
 # Test readiness endpoint
 echo -e "${YELLOW}[TEST] Readiness check${NC}"
-HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT/ready")
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$ENDPOINT/_ready")
 if [ "$HTTP_CODE" == "200" ]; then
     echo -e "${GREEN}✓ Readiness check passed (HTTP $HTTP_CODE)${NC}\n"
 else
@@ -34,7 +34,7 @@ fi
 
 # Test metrics endpoint
 echo -e "${YELLOW}[TEST] Metrics endpoint${NC}"
-METRICS=$(curl -s "$ENDPOINT/metrics")
+METRICS=$(curl -s "$ENDPOINT/_metrics")
 if echo "$METRICS" | grep -q "proxy_rules_total"; then
     echo -e "${GREEN}✓ Metrics endpoint working${NC}\n"
 else
@@ -85,7 +85,7 @@ fi
 
 # Test that metrics are being collected
 echo -e "${YELLOW}[TEST] Metrics collection${NC}"
-METRICS=$(curl -s "$ENDPOINT/metrics")
+METRICS=$(curl -s "$ENDPOINT/_metrics")
 if echo "$METRICS" | grep -q "proxy_requests_total"; then
     echo -e "${GREEN}✓ Metrics collection working (proxy_requests_total found)${NC}\n"
 else
@@ -177,7 +177,7 @@ done
 sleep 1
 
 # Check metrics to see if both backends received requests
-METRICS=$(curl -s "$ENDPOINT/metrics")
+METRICS=$(curl -s "$ENDPOINT/_metrics")
 BACKEND1_REQUESTS=$(echo "$METRICS" | grep 'proxy_requests_total.*backend="localhost:4040".*status_code="200".*subdomain="rr_test"' | grep -oP '} \K\d+' || echo "0")
 BACKEND2_REQUESTS=$(echo "$METRICS" | grep 'proxy_requests_total.*backend="localhost:4041".*status_code="200".*subdomain="rr_test"' | grep -oP '} \K\d+' || echo "0")
 
@@ -206,34 +206,33 @@ else
     echo -e "${YELLOW}⚠ Custom headers test inconclusive (custom headers may not be present)${NC}\n"
 fi
 
-# Test Retry-Policy header
-echo -e "${YELLOW}[TEST] Retry-Policy header (fail-fast vs retry-all)${NC}"
+# Test retry policy (now server-side config via retry_policy in YAML, client header ignored)
+echo -e "${YELLOW}[TEST] Retry policy (server-side config, default: fail-fast)${NC}"
 echo -e "${YELLOW}  → Testing fail-fast behavior (default)${NC}"
 
 # Test fail-fast (should get response from single backend)
 HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
     -H "Host: httpbin.test-api.pocket.network" \
-    -H "Retry-Policy: fail-fast" \
     "$ENDPOINT/get")
 
 if [ "$HTTP_CODE" == "200" ] || [ "$HTTP_CODE" == "502" ] || [ "$HTTP_CODE" == "404" ]; then
-    echo -e "${GREEN}✓ Retry-Policy: fail-fast works (HTTP $HTTP_CODE)${NC}"
+    echo -e "${GREEN}✓ Default fail-fast works (HTTP $HTTP_CODE)${NC}"
 else
-    echo -e "${YELLOW}⚠ Retry-Policy: fail-fast inconclusive (HTTP $HTTP_CODE)${NC}"
+    echo -e "${YELLOW}⚠ Default fail-fast inconclusive (HTTP $HTTP_CODE)${NC}"
 fi
 
-echo -e "${YELLOW}  → Testing retry-all behavior${NC}"
+echo -e "${YELLOW}  → Verifying client Retry-Policy header is ignored${NC}"
 
-# Test retry-all (should try multiple backends if first fails)
+# Client Retry-Policy header should be ignored (security: prevents DoS amplification)
 HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
     -H "Host: rr_test.test-api.pocket.network" \
     -H "Retry-Policy: retry-all" \
     "$ENDPOINT/get")
 
 if [ "$HTTP_CODE" == "200" ] || [ "$HTTP_CODE" == "502" ] || [ "$HTTP_CODE" == "404" ]; then
-    echo -e "${GREEN}✓ Retry-Policy: retry-all works (HTTP $HTTP_CODE)${NC}\n"
+    echo -e "${GREEN}✓ Client Retry-Policy header correctly ignored (HTTP $HTTP_CODE)${NC}\n"
 else
-    echo -e "${YELLOW}⚠ Retry-Policy: retry-all inconclusive (HTTP $HTTP_CODE)${NC}\n"
+    echo -e "${YELLOW}⚠ Client Retry-Policy test inconclusive (HTTP $HTTP_CODE)${NC}\n"
 fi
 
 # Test rate limiting
@@ -357,7 +356,7 @@ fi
 
 # Test rate limit metrics
 echo -e "${YELLOW}[TEST] Rate limiting - Prometheus metrics${NC}"
-METRICS=$(curl -s "$ENDPOINT/metrics")
+METRICS=$(curl -s "$ENDPOINT/_metrics")
 RATELIMIT_ALLOWED=$(echo "$METRICS" | grep 'proxy_ratelimit_requests_total.*action="allowed"' || echo "")
 RATELIMIT_BLOCKED=$(echo "$METRICS" | grep 'proxy_ratelimit_requests_total.*action="blocked"' || echo "")
 

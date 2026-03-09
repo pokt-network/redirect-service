@@ -50,6 +50,15 @@ const (
 	metricsContextKey     = contextKey("metrics_context")
 )
 
+// Pre-compiled regex for Forwarded header parsing (avoid compiling per request)
+var forwardedForRegex = regexp.MustCompile(`for=([^;,\s]+)`)
+
+// Pre-allocated byte slices for health/readiness responses (avoid per-probe allocation)
+var (
+	healthResponseOK    = []byte("OK")
+	readyResponseREADY  = []byte("READY")
+)
+
 // Pre-allocated status code strings to avoid allocations in a hot path
 var statusCodeStrings = map[int]string{
 	200: "200",
@@ -226,6 +235,7 @@ type ServiceConfig struct {
 	RateLimit        string             `yaml:"rate_limit"`
 	RateLimitGlobal  string             `yaml:"rate_limit_global,omitempty"`
 	RateLimitMessage string             `yaml:"rate_limit_message,omitempty"`
+	RetryPolicy      string             `yaml:"retry_policy,omitempty"` // "fail-fast" (default) or "retry-all" — server-side override
 	HealthCheck      *HealthCheckConfig `yaml:"health_check,omitempty"`
 	Backends         []BackendConfig    `yaml:"backends"`
 	Fallbacks        []BackendConfig    `yaml:"fallbacks,omitempty"`
@@ -262,6 +272,7 @@ type ProxyRule struct {
 	RateLimit    *RateLimitConfig // Optional per-IP rate limit
 	GlobalLimit  *RateLimitConfig // Optional global rate limit (all IPs combined)
 	Weight       int              // Backend weight for load balancing (default: 1)
+	RetryPolicy  string           // "fail-fast" (default) or "retry-all" — set from service config
 }
 
 type ProxyService struct {
@@ -270,25 +281,55 @@ type ProxyService struct {
 	loadTime                atomic.Value // time.Time
 	ruleCount               atomic.Int64
 	transport               *http.Transport
-	proxies                 sync.Map                                           // map[string]*httputil.ReverseProxy - cached per backend
-	loadbalancers           *xsync.Map[string, *robin.Loadbalancer[ProxyRule]] // round-robin loadbalancer per subdomain
+	proxies                 sync.Map // map[string]*httputil.ReverseProxy - cached per backend
 	rateLimiter             *RateLimiter
 	rateLimitEnabled        bool
 	defaultRateLimit        *RateLimitConfig
-	defaultRateLimitMessage string // Default rate limit message from YAML config
+	defaultRateLimitMessage atomic.Value // string - Default rate limit message from YAML config
 	trustProxy              bool
-	healthStates            *xsync.Map[string, *BackendHealth]     // Backend health status by URL
-	fallbackRules           *xsync.Map[string, []ProxyRule]        // Fallback backends per subdomain
-	healthCheckConfigs      *xsync.Map[string, *HealthCheckConfig] // Health check config by subdomain
-	healthCheckPool         *pond.WorkerPool                       // Worker pool for health checks
-	healthCheckCron         *cron.Cron                             // Cron scheduler for health checks
+	trustedProxyCIDRs       []*net.IPNet // When set, only trust proxy headers from these source IPs
+	healthStates            atomic.Pointer[xsync.Map[string, *BackendHealth]]     // Backend health status by URL
+	fallbackRules           atomic.Pointer[xsync.Map[string, []ProxyRule]]        // Fallback backends per subdomain
+	healthCheckConfigs      atomic.Pointer[xsync.Map[string, *HealthCheckConfig]] // Health check config by subdomain
+	healthCheckPool         *pond.WorkerPool                                      // Worker pool for health checks
+	healthCheckCron         *cron.Cron                                            // Cron scheduler for health checks
 }
 
 type RateLimiter struct {
 	redis *redis.Client
 }
 
-// CheckLimit checks if the request is within rate limit using sliding window algorithm
+// rateLimitScript is an atomic Lua script for sliding window rate limiting.
+// It checks the count BEFORE adding the request, so blocked requests don't consume budget.
+// Running as a Lua script ensures atomicity across multiple Taiji pods sharing the same Redis.
+var rateLimitScript = redis.NewScript(`
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local window_start = tonumber(ARGV[2])
+local limit = tonumber(ARGV[3])
+local ttl = tonumber(ARGV[4])
+
+-- Clean up old entries
+redis.call('ZREMRANGEBYSCORE', key, '0', window_start)
+
+-- Count current requests in window
+local count = redis.call('ZCARD', key)
+
+-- Only add if under limit (blocked requests don't consume budget)
+if count < limit then
+    redis.call('ZADD', key, now, now)
+    count = count + 1
+end
+
+-- Set TTL for memory cleanup
+redis.call('EXPIRE', key, ttl)
+
+return count
+`)
+
+// CheckLimit checks if the request is within rate limit using sliding window algorithm.
+// Uses a Lua script for atomicity across multiple pods sharing the same Redis.
+// Blocked requests do not consume rate limit budget.
 // Returns: allowed (bool), remaining (int), resetAt (time.Time), error
 func (rl *RateLimiter) CheckLimit(ctx context.Context, ip, subdomain string, limit int, window time.Duration) (bool, int, time.Time, error) {
 	if rl == nil || rl.redis == nil {
@@ -303,39 +344,19 @@ func (rl *RateLimiter) CheckLimit(ctx context.Context, ip, subdomain string, lim
 	}()
 
 	now := time.Now()
-	key := fmt.Sprintf("ratelimit:%s:%s", subdomain, ip)
+	key := "ratelimit:" + subdomain + ":" + ip
 	windowStart := now.Add(-window)
 
-	// Use pipeline for atomic operations
-	pipe := rl.redis.Pipeline()
+	// Execute atomic Lua script
+	count, err := rateLimitScript.Run(ctx, rl.redis, []string{key},
+		now.UnixNano(),                   // ARGV[1]: current timestamp
+		windowStart.UnixNano(),           // ARGV[2]: window start
+		limit,                            // ARGV[3]: max requests
+		int(window.Seconds())+1,          // ARGV[4]: TTL in seconds (window + 1s buffer)
+	).Int64()
 
-	// 1. Add current request timestamp to sorted set
-	pipe.ZAdd(ctx, key, redis.Z{
-		Score:  float64(now.UnixNano()),
-		Member: now.UnixNano(),
-	})
-
-	// 2. Remove timestamps older than a window (CRITICAL for accuracy!)
-	// TTL only removes the entire key when idle - doesn't clean old entries within the sorted set
-	// Without this: a sorted set accumulates old timestamps → inaccurate counts → wrong rate limit enforcement
-	pipe.ZRemRangeByScore(ctx, key, "0", fmt.Sprintf("%d", windowStart.UnixNano()))
-
-	// 3. Count requests in the current window
-	zCard := pipe.ZCard(ctx, key)
-
-	// 4. Set TTL to window duration (memory cleanup for idle keys)
-	pipe.Expire(ctx, key, window)
-
-	// Execute pipeline
-	_, err := pipe.Exec(ctx)
 	if err != nil {
-		return false, 0, time.Time{}, fmt.Errorf("redis pipeline error: %w", err)
-	}
-
-	// Get count result
-	count, err := zCard.Result()
-	if err != nil {
-		return false, 0, time.Time{}, fmt.Errorf("failed to get request count: %w", err)
+		return false, 0, time.Time{}, fmt.Errorf("redis rate limit script error: %w", err)
 	}
 
 	remaining := limit - int(count)
@@ -343,7 +364,6 @@ func (rl *RateLimiter) CheckLimit(ctx context.Context, ip, subdomain string, lim
 		remaining = 0
 	}
 
-	// Calculate reset time (when the oldest request will age out)
 	resetAt := now.Add(window)
 	allowed := count <= int64(limit)
 
@@ -376,9 +396,61 @@ type metricsContext struct {
 	metricsWritten bool // flag to prevent double-recording
 }
 
-// extractClientIP extracts the real client IP from request headers
+// parseTrustedProxyCIDRs parses a comma-separated list of CIDRs into []*net.IPNet.
+// Used to restrict which source IPs are trusted for proxy headers.
+func parseTrustedProxyCIDRs(cidrsStr string) []*net.IPNet {
+	if cidrsStr == "" {
+		return nil
+	}
+	var nets []*net.IPNet
+	for _, cidr := range strings.Split(cidrsStr, ",") {
+		cidr = strings.TrimSpace(cidr)
+		if cidr == "" {
+			continue
+		}
+		// If no mask, treat as single IP (/32 or /128)
+		if !strings.Contains(cidr, "/") {
+			if net.ParseIP(cidr) != nil {
+				if strings.Contains(cidr, ":") {
+					cidr += "/128"
+				} else {
+					cidr += "/32"
+				}
+			}
+		}
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			log.Printf("WARN: Invalid TRUSTED_PROXY_CIDRS entry %q: %v, skipping", cidr, err)
+			continue
+		}
+		nets = append(nets, ipNet)
+	}
+	return nets
+}
+
+// isFromTrustedProxy checks if the remote address is within any trusted proxy CIDR.
+func isFromTrustedProxy(remoteAddr string, trustedCIDRs []*net.IPNet) bool {
+	ip, _, _ := net.SplitHostPort(remoteAddr)
+	if ip == "" {
+		ip = remoteAddr
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	for _, cidr := range trustedCIDRs {
+		if cidr.Contains(parsed) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractClientIP extracts the real client IP from request headers.
+// When trustedProxyCIDRs is set, proxy headers are only trusted if the direct
+// connection comes from a known proxy IP. This prevents IP spoofing.
 // Priority: Forwarded (RFC 7239) > CF-Connecting-IP > True-Client-IP > X-Forwarded-For > X-Real-IP > RemoteAddr
-func extractClientIP(r *http.Request, trustProxy bool) string {
+func extractClientIP(r *http.Request, trustProxy bool, trustedProxyCIDRs ...[]*net.IPNet) string {
 	if !trustProxy {
 		// In development or when not behind a proxy, use RemoteAddr directly
 		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
@@ -388,12 +460,23 @@ func extractClientIP(r *http.Request, trustProxy bool) string {
 		return ip
 	}
 
+	// If trusted CIDRs are configured, only trust headers from known proxies
+	if len(trustedProxyCIDRs) > 0 && len(trustedProxyCIDRs[0]) > 0 {
+		if !isFromTrustedProxy(r.RemoteAddr, trustedProxyCIDRs[0]) {
+			// Not from a trusted proxy — use RemoteAddr directly (ignore spoofable headers)
+			ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+			if ip == "" {
+				return r.RemoteAddr
+			}
+			return ip
+		}
+	}
+
 	// 1. Check RFC 7239 Forwarded header (standard)
 	if forwarded := r.Header.Get("Forwarded"); forwarded != "" {
 		// Parse "for=xxx" from Forwarded header
 		// Example: "for=192.0.2.60;host=example.com;proto=https"
-		forRegex := regexp.MustCompile(`for=([^;,\s]+)`)
-		if matches := forRegex.FindStringSubmatch(forwarded); len(matches) > 1 {
+		if matches := forwardedForRegex.FindStringSubmatch(forwarded); len(matches) > 1 {
 			ip := strings.Trim(matches[1], "\"[]")
 			if validIP := net.ParseIP(ip); validIP != nil {
 				return ip
@@ -458,10 +541,25 @@ func extractClientIP(r *http.Request, trustProxy bool) string {
 //   - "http://eth.grove.city:443" → "grove.city"
 //   - "http://192.168.1.1:8080" → "192.168.1.1"
 //   - "http://localhost:8080" → "localhost"
+// normalizedBackendCache caches normalizeBackendLabel results to avoid URL parsing per request
+var normalizedBackendCache sync.Map // map[string]string
+
 func normalizeBackendLabel(backendURL string) string {
 	if backendURL == "" {
 		return "unknown"
 	}
+
+	// Check cache first
+	if cached, ok := normalizedBackendCache.Load(backendURL); ok {
+		return cached.(string)
+	}
+
+	result := normalizeBackendLabelUncached(backendURL)
+	normalizedBackendCache.Store(backendURL, result)
+	return result
+}
+
+func normalizeBackendLabelUncached(backendURL string) string {
 
 	// Parse the URL to extract hostname
 	parsedURL, err := url.Parse(backendURL)
@@ -508,9 +606,9 @@ func getRequestKind(r *http.Request) string {
 	switch r.URL.Path {
 	case "/_health", "/healthz":
 		return "health"
-	case "/ready", "/readyz":
+	case "/_ready", "/readyz":
 		return "ready"
-	case "/metrics":
+	case "/_metrics":
 		return "metrics"
 	}
 
@@ -635,7 +733,7 @@ func NewProxyService(configPath string, rateLimiter *RateLimiter, rateLimitEnabl
 		// Timeouts
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 0, // No timeout - support long-running requests
+		ResponseHeaderTimeout: 5 * time.Minute, // Prevent hanging backends from holding goroutines forever
 
 		// Proxy settings
 		DisableKeepAlives:  false,
@@ -655,21 +753,21 @@ func NewProxyService(configPath string, rateLimiter *RateLimiter, rateLimitEnabl
 	healthCheckCron := cron.New()
 
 	s := &ProxyService{
-		configPath:         configPath,
-		rateLimiter:        rateLimiter,
-		rateLimitEnabled:   rateLimitEnabled,
-		defaultRateLimit:   defaultRateLimit,
-		trustProxy:         trustProxy,
-		loadbalancers:      xsync.NewMap[string, *robin.Loadbalancer[ProxyRule]](),
-		transport:          transport,
-		healthStates:       xsync.NewMap[string, *BackendHealth](),
-		fallbackRules:      xsync.NewMap[string, []ProxyRule](),
-		healthCheckConfigs: xsync.NewMap[string, *HealthCheckConfig](),
-		healthCheckPool:    healthCheckPool,
-		healthCheckCron:    healthCheckCron,
+		configPath:       configPath,
+		rateLimiter:      rateLimiter,
+		rateLimitEnabled: rateLimitEnabled,
+		defaultRateLimit: defaultRateLimit,
+		trustProxy:       trustProxy,
+		transport:        transport,
+		healthCheckPool:  healthCheckPool,
+		healthCheckCron:  healthCheckCron,
 	}
 	s.rules.Store(make(map[string][]ProxyRule))
 	s.loadTime.Store(time.Now())
+	s.defaultRateLimitMessage.Store("")
+	s.healthStates.Store(xsync.NewMap[string, *BackendHealth]())
+	s.fallbackRules.Store(xsync.NewMap[string, []ProxyRule]())
+	s.healthCheckConfigs.Store(xsync.NewMap[string, *HealthCheckConfig]())
 	return s
 }
 
@@ -697,7 +795,7 @@ func (s *ProxyService) LoadRules() error {
 	}
 
 	// Store the default rate limit message from YAML (will hot-reload)
-	s.defaultRateLimitMessage = strings.TrimSpace(config.RateLimitMessageDefault)
+	s.defaultRateLimitMessage.Store(strings.TrimSpace(config.RateLimitMessageDefault))
 
 	newRules := make(map[string][]ProxyRule)
 	newFallbacks := xsync.NewMap[string, []ProxyRule]()
@@ -747,6 +845,13 @@ func (s *ProxyService) LoadRules() error {
 		}
 
 		// Process primary backends with weight expansion
+		// Parse retry policy for this service (server-side config, not client header)
+		retryPolicy := strings.ToLower(strings.TrimSpace(svc.RetryPolicy))
+		if retryPolicy != "" && retryPolicy != "fail-fast" && retryPolicy != "retry-all" {
+			log.Printf("WARN: Invalid retry_policy '%s' for service '%s', using fail-fast", svc.RetryPolicy, subdomain)
+			retryPolicy = ""
+		}
+
 		var backends []ProxyRule
 		for j, backend := range svc.Backends {
 			rule, err := s.parseBackendConfig(backend, rateLimit, globalLimit, j, false)
@@ -754,6 +859,7 @@ func (s *ProxyService) LoadRules() error {
 				log.Printf("WARN: Skipping backend %d for service '%s': %v", j, subdomain, err)
 				continue
 			}
+			rule.RetryPolicy = retryPolicy
 
 			// Expand backend based on weight (duplicate entries)
 			for w := 0; w < rule.Weight; w++ {
@@ -762,7 +868,8 @@ func (s *ProxyService) LoadRules() error {
 			}
 
 			// Initialize or preserve health state for this backend
-			existingHealth, exists := s.healthStates.Load(rule.ProxyTo)
+			currentHealthStates := s.healthStates.Load()
+			existingHealth, exists := currentHealthStates.Load(rule.ProxyTo)
 			if exists {
 				// Preserve existing health state on reload
 				newHealthStates.Store(rule.ProxyTo, existingHealth)
@@ -796,7 +903,8 @@ func (s *ProxyService) LoadRules() error {
 				totalFallbacks++
 
 				// Initialize or preserve health state for fallback
-				existingHealth, exists := s.healthStates.Load(rule.ProxyTo)
+				currentHealthStates := s.healthStates.Load()
+				existingHealth, exists := currentHealthStates.Load(rule.ProxyTo)
 				if exists {
 					// Preserve existing health state on reload
 					newHealthStates.Store(rule.ProxyTo, existingHealth)
@@ -835,20 +943,12 @@ func (s *ProxyService) LoadRules() error {
 	s.loadTime.Store(now)
 	s.ruleCount.Store(int64(len(newRules)))
 
-	// Rebuild loadbalancers for primary backends
-	newLoadbalancers := xsync.NewMap[string, *robin.Loadbalancer[ProxyRule]]()
-	for subdomain, backends := range newRules {
-		if len(backends) > 0 {
-			newLoadbalancers.Store(subdomain, robin.NewLoadbalancer(backends))
-		}
-	}
-	s.loadbalancers = newLoadbalancers
-
 	// Track health check changes (additions/removals)
 	var addedHealthChecks, removedHealthChecks []string
 
 	// Check for removed health checks
-	s.healthCheckConfigs.Range(func(subdomain string, oldConfig *HealthCheckConfig) bool {
+	oldHealthCheckConfigs := s.healthCheckConfigs.Load()
+	oldHealthCheckConfigs.Range(func(subdomain string, oldConfig *HealthCheckConfig) bool {
 		if _, exists := newHealthCheckConfigs.Load(subdomain); !exists {
 			removedHealthChecks = append(removedHealthChecks, subdomain)
 		}
@@ -857,7 +957,7 @@ func (s *ProxyService) LoadRules() error {
 
 	// Check for added health checks
 	newHealthCheckConfigs.Range(func(subdomain string, newConfig *HealthCheckConfig) bool {
-		if _, exists := s.healthCheckConfigs.Load(subdomain); !exists {
+		if _, exists := oldHealthCheckConfigs.Load(subdomain); !exists {
 			addedHealthChecks = append(addedHealthChecks, subdomain)
 		}
 		return true
@@ -872,9 +972,9 @@ func (s *ProxyService) LoadRules() error {
 	}
 
 	// Atomic swap of health-related data
-	s.fallbackRules = newFallbacks
-	s.healthCheckConfigs = newHealthCheckConfigs
-	s.healthStates = newHealthStates
+	s.fallbackRules.Store(newFallbacks)
+	s.healthCheckConfigs.Store(newHealthCheckConfigs)
+	s.healthStates.Store(newHealthStates)
 
 	// Update Prometheus metrics
 	proxyRulesTotal.Set(float64(totalBackends))
@@ -887,7 +987,7 @@ func (s *ProxyService) LoadRules() error {
 	}
 
 	// Initialize health states in metrics
-	s.healthStates.Range(func(backendURL string, health *BackendHealth) bool {
+	s.healthStates.Load().Range(func(backendURL string, health *BackendHealth) bool {
 		// Extract subdomain from rules (reverse lookup)
 		for subdomain, backends := range newRules {
 			for _, backend := range backends {
@@ -973,13 +1073,18 @@ func (s *ProxyService) runHealthChecks() {
 	// Iterate over all services and check each backend
 	for subdomain, backends := range rules {
 		// Check if this service has health check configured
-		healthCheckConfig, hasHealthCheck := s.healthCheckConfigs.Load(subdomain)
+		healthCheckConfig, hasHealthCheck := s.healthCheckConfigs.Load().Load(subdomain)
 		if !hasHealthCheck {
 			continue // No health check for this service - always healthy
 		}
 
-		// Submit a health check task for each primary backend
+		// Submit a health check task for each unique primary backend (deduplicate weighted entries)
+		seen := make(map[string]bool)
 		for _, backend := range backends {
+			if seen[backend.ProxyTo] {
+				continue
+			}
+			seen[backend.ProxyTo] = true
 			backendURL := backend.ProxyTo
 			config := healthCheckConfig
 
@@ -990,9 +1095,13 @@ func (s *ProxyService) runHealthChecks() {
 		}
 
 		// Also check fallback backends if they exist
-		fallbacks, hasFallbacks := s.fallbackRules.Load(subdomain)
+		fallbacks, hasFallbacks := s.fallbackRules.Load().Load(subdomain)
 		if hasFallbacks {
 			for _, fallback := range fallbacks {
+				if seen[fallback.ProxyTo] {
+					continue
+				}
+				seen[fallback.ProxyTo] = true
 				backendURL := fallback.ProxyTo
 				config := healthCheckConfig
 
@@ -1007,7 +1116,7 @@ func (s *ProxyService) runHealthChecks() {
 // performHealthCheck executes a single health check against a backend
 func (s *ProxyService) performHealthCheck(subdomain, backendURL string, config *HealthCheckConfig) {
 	// Load health state (should always exist)
-	health, exists := s.healthStates.Load(backendURL)
+	health, exists := s.healthStates.Load().Load(backendURL)
 	if !exists {
 		log.Printf("WARN: No health state found for backend %s", backendURL)
 		return
@@ -1111,7 +1220,7 @@ func (s *ProxyService) recordHealthCheckFailure(subdomain, backendURL string, he
 
 	// Get configurable failure threshold (default: 5)
 	threshold := int32(5)
-	if config, exists := s.healthCheckConfigs.Load(subdomain); exists {
+	if config, exists := s.healthCheckConfigs.Load().Load(subdomain); exists {
 		if config.FailureThreshold > 0 {
 			threshold = int32(config.FailureThreshold)
 		}
@@ -1137,13 +1246,13 @@ func (s *ProxyService) recordHealthCheckFailure(subdomain, backendURL string, he
 // If no health check is configured for the service, always returns true
 func (s *ProxyService) isBackendHealthy(subdomain, backendURL string) bool {
 	// Check if health checks are configured for this service
-	_, hasHealthCheck := s.healthCheckConfigs.Load(subdomain)
+	_, hasHealthCheck := s.healthCheckConfigs.Load().Load(subdomain)
 	if !hasHealthCheck {
 		return true // No health check = always healthy
 	}
 
 	// Load health state
-	health, exists := s.healthStates.Load(backendURL)
+	health, exists := s.healthStates.Load().Load(backendURL)
 	if !exists {
 		return true // No state yet = assume it healthy
 	}
@@ -1166,13 +1275,13 @@ func (s *ProxyService) filterHealthyBackends(subdomain string, backends []ProxyR
 // This provides faster failure detection compared to active health checks (cron-based)
 func (s *ProxyService) recordPassiveHealthCheckFailure(subdomain, backendURL string) {
 	// Only track passive health for backends that have active health checks configured
-	_, hasHealthCheck := s.healthCheckConfigs.Load(subdomain)
+	_, hasHealthCheck := s.healthCheckConfigs.Load().Load(subdomain)
 	if !hasHealthCheck {
 		return // No health check configured, don't track passive health
 	}
 
 	// Load health state
-	health, exists := s.healthStates.Load(backendURL)
+	health, exists := s.healthStates.Load().Load(backendURL)
 	if !exists {
 		return // No health state = no health check configured
 	}
@@ -1227,7 +1336,7 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 
 	// If no healthy primary backends, try fallbacks
 	if len(healthyBackends) == 0 {
-		fallbacks, hasFallbacks := s.fallbackRules.Load(subdomain)
+		fallbacks, hasFallbacks := s.fallbackRules.Load().Load(subdomain)
 		if hasFallbacks {
 			healthyFallbacks := s.filterHealthyBackends(subdomain, fallbacks)
 			if len(healthyFallbacks) > 0 {
@@ -1250,7 +1359,7 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	backends = healthyBackends
 
 	// Get client IP using proper extraction (handles HAProxy/Cloudflare headers)
-	clientIP := extractClientIP(r, s.trustProxy)
+	clientIP := extractClientIP(r, s.trustProxy, s.trustedProxyCIDRs)
 
 	// Check rate limit if enabled
 	if s.rateLimitEnabled && s.rateLimiter != nil {
@@ -1292,8 +1401,8 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 				message := "Too Many Requests: Rate limit exceeded"
 				if globalConfig.Message != "" {
 					message = globalConfig.Message
-				} else if s.defaultRateLimitMessage != "" {
-					message = s.defaultRateLimitMessage
+				} else if msg, _ := s.defaultRateLimitMessage.Load().(string); msg != "" {
+					message = msg
 				}
 
 				http.Error(w, message, http.StatusTooManyRequests)
@@ -1351,9 +1460,9 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 					if rateLimitConfig.Message != "" {
 						// Per-service custom message
 						message = rateLimitConfig.Message
-					} else if s.defaultRateLimitMessage != "" {
+					} else if msg, _ := s.defaultRateLimitMessage.Load().(string); msg != "" {
 						// Global default message from YAML
-						message = s.defaultRateLimitMessage
+						message = msg
 					}
 
 					http.Error(w, message, http.StatusTooManyRequests)
@@ -1367,22 +1476,21 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Check retry policy from the header (default: fail-fast)
-	retryPolicy := r.Header.Get("Retry-Policy")
+	// Determine retry policy: server-side config takes priority over client header.
+	// This prevents clients from forcing retry-all (DoS amplification vector).
+	retryPolicy := backends[0].RetryPolicy
 	if retryPolicy == "" {
+		// No server-side config — fall back to fail-fast (ignore client header)
 		retryPolicy = "fail-fast"
-	} else {
-		retryPolicy = strings.ToLower(strings.TrimSpace(retryPolicy))
 	}
 
-	// Round-robin: get loadbalancer for this subdomain (using atomicgo/robin)
-	lb, exists := s.loadbalancers.Load(subdomain)
-	if !exists {
-		// This shouldn't happen since we rebuild loadbalancers on CSV load
-		// Wrapper will record metrics with backend="unknown", status=500
-		http.Error(w, "Internal Server Error: No loadbalancer found", http.StatusInternalServerError)
-		return
-	}
+	// Build a loadbalancer from healthy backends only.
+	// This ensures unhealthy backends never receive traffic, and the per-request LB
+	// avoids retry loops from distorting the global round-robin position.
+	lb := robin.NewLoadbalancer(backends)
+
+	// Count unique backends for retry-all logic (weights create duplicates)
+	uniqueBackendCount := countUniqueBackends(backends)
 
 	// Streaming requests (WebSocket, gRPC) must use direct proxy - no buffering, no retry
 	// This ensures proper HTTP upgrade handling and streaming semantics
@@ -1393,10 +1501,10 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Retry-all with multiple backends: use buffered retry logic
-	if retryPolicy == "retry-all" && len(backends) > 1 {
+	if retryPolicy == "retry-all" && uniqueBackendCount > 1 {
 		triedURLs := make(map[string]bool) // Track which backends we've tried
 		attemptCount := 0
-		maxAttempts := len(backends) * 2 // Safety limit to prevent infinite loop
+		maxAttempts := len(backends) + uniqueBackendCount // Safety limit to prevent infinite loop
 
 		for attemptCount < maxAttempts {
 			rule := lb.Next()
@@ -1408,7 +1516,7 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 			}
 			triedURLs[rule.ProxyTo] = true
 
-			isLastAttempt := len(triedURLs) >= len(backends) // Check if we've tried all unique backends
+			isLastAttempt := len(triedURLs) >= uniqueBackendCount // Check if we've tried all unique backends
 			success, _, shouldReturn := s.tryBackend(w, r, subdomain, rule, start, host, clientIP, isLastAttempt)
 			attemptCount++
 
@@ -1488,15 +1596,8 @@ func (s *ProxyService) tryBackend(w http.ResponseWriter, r *http.Request, subdom
 
 	// Get or create a cached proxy for this backend
 	cacheKey := targetURL.Scheme + "://" + targetURL.Host
-	var proxy *httputil.ReverseProxy
-
-	if cached, ok := s.proxies.Load(cacheKey); ok {
-		proxy = cached.(*httputil.ReverseProxy)
-	} else {
-		// Create a new reverse proxy
-		proxy = s.createReverseProxy()
-		s.proxies.Store(cacheKey, proxy)
-	}
+	actual, _ := s.proxies.LoadOrStore(cacheKey, s.createReverseProxy())
+	proxy := actual.(*httputil.ReverseProxy)
 
 	// For retry-all on non-last attempts, we need to capture the response to check status
 	if !isLastAttempt {
@@ -1597,15 +1698,8 @@ func (s *ProxyService) tryBackendDirect(w http.ResponseWriter, r *http.Request, 
 
 	// Get or create a cached proxy for this backend
 	cacheKey := targetURL.Scheme + "://" + targetURL.Host
-	var proxy *httputil.ReverseProxy
-
-	if cached, ok := s.proxies.Load(cacheKey); ok {
-		proxy = cached.(*httputil.ReverseProxy)
-	} else {
-		// Create a new reverse proxy
-		proxy = s.createReverseProxy()
-		s.proxies.Store(cacheKey, proxy)
-	}
+	actual, _ := s.proxies.LoadOrStore(cacheKey, s.createReverseProxy())
+	proxy := actual.(*httputil.ReverseProxy)
 
 	// Direct proxy - no buffering, supports streaming, WebSocket, gRPC
 	proxy.ServeHTTP(w, r)
@@ -1680,7 +1774,7 @@ func (s *ProxyService) createReverseProxy() *httputil.ReverseProxy {
 			req.Header.Set("X-Forwarded-Host", meta.host)
 
 			// Add standard Forwarded header (RFC 7239)
-			forwardedValue := fmt.Sprintf("for=%s;host=%s;proto=%s", meta.clientIP, meta.host, meta.scheme)
+			forwardedValue := "for=" + meta.clientIP + ";host=" + meta.host + ";proto=" + meta.scheme
 			if prior, ok := req.Header["Forwarded"]; ok {
 				req.Header.Set("Forwarded", strings.Join(prior, ", ")+", "+forwardedValue)
 			} else {
@@ -1740,11 +1834,21 @@ func singleJoiningSlash(a, b string) string {
 	return a + b
 }
 
+// countUniqueBackends counts the number of unique backend URLs in a slice
+// (weight-expanded backends contain duplicates)
+func countUniqueBackends(backends []ProxyRule) int {
+	seen := make(map[string]struct{}, len(backends))
+	for _, b := range backends {
+		seen[b.ProxyTo] = struct{}{}
+	}
+	return len(seen)
+}
+
 // HandleHealth health check endpoint
 func (s *ProxyService) HandleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
-	_, err := w.Write([]byte("OK"))
+	_, err := w.Write(healthResponseOK)
 	if err != nil {
 		log.Printf("ERROR: fail to write health response: %v", err)
 		return
@@ -1760,7 +1864,7 @@ func (s *ProxyService) HandleReady(w http.ResponseWriter, _ *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
-	_, err := w.Write([]byte("READY"))
+	_, err := w.Write(readyResponseREADY)
 	if err != nil {
 		log.Printf("ERROR: fail to write ready response: %v", err)
 		return
@@ -1804,6 +1908,11 @@ func (rw *responseWriterWrapper) Flush() {
 	if flusher, ok := rw.ResponseWriter.(http.Flusher); ok {
 		flusher.Flush()
 	}
+}
+
+// Unwrap returns the underlying ResponseWriter for Go 1.20+ http.ResponseController
+func (rw *responseWriterWrapper) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
 }
 
 // metricsWrapper wraps an HTTP handler to guarantee metrics recording for ALL requests
@@ -1903,29 +2012,29 @@ func extractSubdomainFromHost(host string) string {
 		return "unknown"
 	}
 
-	// Remove port if present
-	hostWithoutPort, _, err := net.SplitHostPort(host)
-	if err == nil {
-		host = hostWithoutPort
+	// Use IndexByte instead of Split to avoid allocation
+	// First strip port if present (e.g., "eth.api.pocket.network:8080")
+	if colonIdx := strings.IndexByte(host, ':'); colonIdx != -1 {
+		host = host[:colonIdx]
 	}
 
-	// Extract subdomain (first part)
-	parts := strings.Split(host, ".")
-	if len(parts) > 0 {
-		return parts[0]
+	// Extract subdomain (everything before first dot)
+	if dotIdx := strings.IndexByte(host, '.'); dotIdx > 0 {
+		return host[:dotIdx]
 	}
 
-	return "unknown"
+	// No dot found — return the whole host (e.g., "localhost")
+	return host
 }
 
 // Router multiplexes requests to appropriate handlers
 func (s *ProxyService) Router() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", s.HandleHealth)
+	mux.HandleFunc("/_health", s.HandleHealth)
 	mux.HandleFunc("/healthz", s.HandleHealth)
-	mux.HandleFunc("/ready", s.HandleReady)
+	mux.HandleFunc("/_ready", s.HandleReady)
 	mux.HandleFunc("/readyz", s.HandleReady)
-	mux.Handle("/metrics", promhttp.Handler())
+	mux.Handle("/_metrics", promhttp.Handler())
 	mux.HandleFunc("/", s.HandleProxy)
 
 	// Wrap with metrics middleware to guarantee metric recording for all requests
@@ -2074,15 +2183,16 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("INFO: Starting Taiji (太极) v1.3.0 - High-performance reverse proxy...")
 
-	// Enable pprof profiling
-	runtime.SetMutexProfileFraction(1) // Enable mutex profiling
-	runtime.SetBlockProfileRate(1)     // Enable block profiling
+	// Enable pprof profiling by default for quick K8s debugging (disable with PPROF_DISABLED=true)
+	if os.Getenv("PPROF_DISABLED") != "true" {
+		runtime.SetMutexProfileFraction(100) // Sample 1% of mutex contention events
+		runtime.SetBlockProfileRate(100)     // Sample 1% of block events
 
-	// Start pprof server on port 6060
-	go func() {
-		log.Println("INFO: Starting pprof server on :6060")
-		log.Println(http.ListenAndServe("localhost:6060", nil))
-	}()
+		go func() {
+			log.Println("INFO: Starting pprof server on :6060")
+			log.Println(http.ListenAndServe("localhost:6060", nil))
+		}()
+	}
 
 	// Get configuration from the environment
 	configPath := os.Getenv("CONFIG_PATH")
@@ -2177,8 +2287,15 @@ func main() {
 		log.Println("INFO: Rate limiting disabled")
 	}
 
+	// Parse trusted proxy CIDRs (optional - when set, only trust headers from these IPs)
+	trustedProxyCIDRs := parseTrustedProxyCIDRs(os.Getenv("TRUSTED_PROXY_CIDRS"))
+	if len(trustedProxyCIDRs) > 0 {
+		log.Printf("INFO: Trusted proxy CIDRs configured: %d entries (proxy headers only trusted from these sources)", len(trustedProxyCIDRs))
+	}
+
 	// Initialize service
 	service := NewProxyService(configPath, rateLimiter, rateLimitEnabled, defaultRateLimit, trustProxy)
+	service.trustedProxyCIDRs = trustedProxyCIDRs
 
 	// Initial load
 	if err := service.LoadRules(); err != nil {
@@ -2215,8 +2332,8 @@ func main() {
 		WriteTimeout: 0,
 		// IdleTimeout for keep-alive connections
 		IdleTimeout: 120 * time.Second,
-		// MaxHeaderBytes prevents huge headers
-		MaxHeaderBytes: 1 << 20, // 1MB
+		// MaxHeaderBytes prevents huge headers (64KB is sufficient for most proxied traffic)
+		MaxHeaderBytes: 64 * 1024, // 64KB
 	}
 
 	// Handle a graceful shutdown
