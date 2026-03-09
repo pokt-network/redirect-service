@@ -506,7 +506,7 @@ func normalizeBackendLabel(backendURL string) string {
 func getRequestKind(r *http.Request) string {
 	// Check path-based kinds first
 	switch r.URL.Path {
-	case "/health", "/healthz":
+	case "/_health", "/healthz":
 		return "health"
 	case "/ready", "/readyz":
 		return "ready"
