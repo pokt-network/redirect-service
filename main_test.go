@@ -25,7 +25,7 @@ func newTestBackend(t *testing.T, statusCode int) (*httptest.Server, *atomic.Int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		count.Add(1)
 		w.WriteHeader(statusCode)
-		fmt.Fprintf(w, "backend-%d", statusCode)
+		_, _ = fmt.Fprintf(w, "backend-%d", statusCode)
 	}))
 	t.Cleanup(srv.Close)
 	return srv, count
@@ -340,7 +340,7 @@ func TestBug19_ReadyMetricsCollision(t *testing.T) {
 	// Create a backend that serves /ready with custom content
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		fmt.Fprintf(w, "backend-ready-response at %s", r.URL.Path)
+		_, _ = fmt.Fprintf(w, "backend-ready-response at %s", r.URL.Path)
 	}))
 	t.Cleanup(backend.Close)
 
@@ -540,11 +540,11 @@ func TestWebSocketUpgradeProxied(t *testing.T) {
 			t.Errorf("Backend hijack failed: %v", err)
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		// Write a raw HTTP 101 response + echo message
-		bufrw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-		bufrw.WriteString("hello from backend")
-		bufrw.Flush()
+		_, _ = bufrw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_, _ = bufrw.WriteString("hello from backend")
+		_ = bufrw.Flush()
 	}))
 	t.Cleanup(backend.Close)
 
@@ -564,7 +564,7 @@ func TestWebSocketUpgradeProxied(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to connect to frontend: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	// Send WebSocket upgrade request
 	reqStr := "GET / HTTP/1.1\r\n" +
@@ -579,7 +579,7 @@ func TestWebSocketUpgradeProxied(t *testing.T) {
 	}
 
 	// Read response
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	reader := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(reader, nil)
 	if err != nil {

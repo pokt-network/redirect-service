@@ -2345,6 +2345,7 @@ func main() {
 		defer cancel()
 		if err := redisClient.Ping(ctx).Err(); err != nil {
 			log.Printf("WARN: Failed to connect to Redis at %s: %v (rate limiting will be disabled)", redisAddr, err)
+			_ = redisClient.Close()
 			rateLimitEnabled = false
 		} else {
 			log.Printf("INFO: Connected to Redis at %s for rate limiting", redisAddr)
