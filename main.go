@@ -60,8 +60,8 @@ var forwardedForRegex = regexp.MustCompile(`for=([^;,\s]+)`)
 
 // Pre-allocated byte slices for health/readiness responses (avoid per-probe allocation)
 var (
-	healthResponseOK    = []byte("OK")
-	readyResponseREADY  = []byte("READY")
+	healthResponseOK   = []byte("OK")
+	readyResponseREADY = []byte("READY")
 )
 
 // Pre-allocated status code strings to avoid allocations in a hot path
@@ -324,7 +324,7 @@ type ProxyService struct {
 	defaultRateLimit        *RateLimitConfig
 	defaultRateLimitMessage atomic.Value // string - Default rate limit message from YAML config
 	trustProxy              bool
-	trustedProxyCIDRs       []*net.IPNet // When set, only trust proxy headers from these source IPs
+	trustedProxyCIDRs       []*net.IPNet                                          // When set, only trust proxy headers from these source IPs
 	healthStates            atomic.Pointer[xsync.Map[string, *BackendHealth]]     // Backend health status by URL
 	fallbackRules           atomic.Pointer[xsync.Map[string, []ProxyRule]]        // Fallback backends per subdomain
 	healthCheckConfigs      atomic.Pointer[xsync.Map[string, *HealthCheckConfig]] // Health check config by subdomain
@@ -386,10 +386,10 @@ func (rl *RateLimiter) CheckLimit(ctx context.Context, ip, subdomain string, lim
 
 	// Execute atomic Lua script
 	count, err := rateLimitScript.Run(ctx, rl.redis, []string{key},
-		now.UnixNano(),                   // ARGV[1]: current timestamp
-		windowStart.UnixNano(),           // ARGV[2]: window start
-		limit,                            // ARGV[3]: max requests
-		int(window.Seconds())+1,          // ARGV[4]: TTL in seconds (window + 1s buffer)
+		now.UnixNano(),          // ARGV[1]: current timestamp
+		windowStart.UnixNano(),  // ARGV[2]: window start
+		limit,                   // ARGV[3]: max requests
+		int(window.Seconds())+1, // ARGV[4]: TTL in seconds (window + 1s buffer)
 	).Int64()
 
 	if err != nil {
@@ -578,6 +578,7 @@ func extractClientIP(r *http.Request, trustProxy bool, trustedProxyCIDRs ...[]*n
 //   - "http://eth.grove.city:443" → "grove.city"
 //   - "http://192.168.1.1:8080" → "192.168.1.1"
 //   - "http://localhost:8080" → "localhost"
+//
 // normalizedBackendCache caches normalizeBackendLabel results to avoid URL parsing per request
 var normalizedBackendCache sync.Map // map[string]string
 

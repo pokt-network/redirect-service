@@ -803,8 +803,8 @@ func TestSingleJoiningSlashNormalization(t *testing.T) {
 	}{
 		{"/api", "/v1/data", "/api/v1/data"},
 		{"/api/", "/v1/data", "/api/v1/data"},
-		{"/api", "/../admin", "/admin"},       // traversal normalized
-		{"/api", "/./v1/../v2", "/api/v2"},    // complex traversal
+		{"/api", "/../admin", "/admin"},    // traversal normalized
+		{"/api", "/./v1/../v2", "/api/v2"}, // complex traversal
 		{"/", "/", "/"},
 		{"/api", "/", "/api"},
 	}
@@ -1136,4 +1136,3 @@ func TestForwardedHeaderIPv6Quoting(t *testing.T) {
 		t.Errorf("IPv6 address not quoted in Forwarded header: %q", receivedForwarded)
 	}
 }
-
