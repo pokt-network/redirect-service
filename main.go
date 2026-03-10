@@ -26,7 +26,6 @@ import (
 	"syscall"
 	"time"
 
-	"atomicgo.dev/robin"
 	"github.com/alitto/pond"
 	"github.com/fsnotify/fsnotify"
 	"github.com/prometheus/client_golang/prometheus"
@@ -330,6 +329,7 @@ type ProxyService struct {
 	healthCheckConfigs      atomic.Pointer[xsync.Map[string, *HealthCheckConfig]] // Health check config by subdomain
 	healthCheckPool         *pond.WorkerPool                                      // Worker pool for health checks
 	healthCheckCron         *cron.Cron                                            // Cron scheduler for health checks
+	rrCounters              sync.Map                                              // map[string]*atomic.Uint64 — Per-subdomain round-robin counters
 }
 
 type RateLimiter struct {
@@ -1527,10 +1527,11 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		retryPolicy = "fail-fast"
 	}
 
-	// Build a loadbalancer from healthy backends only.
-	// This ensures unhealthy backends never receive traffic, and the per-request LB
-	// avoids retry loops from distorting the global round-robin position.
-	lb := robin.NewLoadbalancer(backends)
+	// Get or create a persistent round-robin counter for this subdomain.
+	// The counter is shared across requests so round-robin distribution is maintained,
+	// while the healthy backends slice is rebuilt per-request to exclude unhealthy backends.
+	actual, _ := s.rrCounters.LoadOrStore(subdomain, &atomic.Uint64{})
+	counter := actual.(*atomic.Uint64)
 
 	// Count unique backends for retry-all logic (weights create duplicates)
 	uniqueBackendCount := countUniqueBackends(backends)
@@ -1538,7 +1539,7 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	// Streaming requests (WebSocket, gRPC) must use direct proxy - no buffering, no retry
 	// This ensures proper HTTP upgrade handling and streaming semantics
 	if isStreamingRequest(r) {
-		rule := lb.Next()
+		rule := nextBackend(backends, counter)
 		s.tryBackendDirect(w, r, subdomain, rule, start, host, clientIP)
 		return
 	}
@@ -1550,7 +1551,7 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		maxAttempts := len(backends) + uniqueBackendCount // Safety limit to prevent infinite loop
 
 		for attemptCount < maxAttempts {
-			rule := lb.Next()
+			rule := nextBackend(backends, counter)
 
 			// Skip if already tried this backend
 			if triedURLs[rule.ProxyTo] {
@@ -1590,7 +1591,7 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 
 	// Default: fail-fast or single backend - use direct proxy (no buffering)
 	// This provides true zero-copy streaming for optimal performance
-	rule := lb.Next()
+	rule := nextBackend(backends, counter)
 	s.tryBackendDirect(w, r, subdomain, rule, start, host, clientIP)
 }
 
@@ -1886,6 +1887,14 @@ func (s *ProxyService) createReverseProxy() *httputil.ReverseProxy {
 		},
 		FlushInterval: -1, // Flush immediately for streaming
 	}
+}
+
+// nextBackend picks the next backend from the slice using a shared atomic counter.
+// This provides true round-robin distribution across requests while allowing the
+// backends slice to change per-request (e.g., after health filtering).
+func nextBackend(backends []ProxyRule, counter *atomic.Uint64) ProxyRule {
+	idx := counter.Add(1) - 1
+	return backends[idx%uint64(len(backends))]
 }
 
 // singleJoiningSlash joins two URL paths with a single slash and normalizes

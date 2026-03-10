@@ -1136,3 +1136,101 @@ func TestForwardedHeaderIPv6Quoting(t *testing.T) {
 		t.Errorf("IPv6 address not quoted in Forwarded header: %q", receivedForwarded)
 	}
 }
+
+// --- Round-robin distribution across requests ---
+
+func TestRoundRobinDistribution(t *testing.T) {
+	countA := &atomic.Int64{}
+	countB := &atomic.Int64{}
+
+	backendA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		countA.Add(1)
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(backendA.Close)
+
+	backendB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		countB.Add(1)
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(backendB.Close)
+
+	svc := newTestProxyService(t)
+	// Equal weights: each backend should get ~50% of traffic
+	rules := map[string][]ProxyRule{
+		"test": {
+			{ProxyTo: backendA.URL, Weight: 1},
+			{ProxyTo: backendB.URL, Weight: 1},
+		},
+	}
+	injectRules(svc, rules)
+
+	router := svc.Router()
+
+	// Send 100 requests
+	for i := 0; i < 100; i++ {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Host = "test.api.pocket.network"
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+	}
+
+	a := countA.Load()
+	b := countB.Load()
+	t.Logf("Backend A: %d, Backend B: %d", a, b)
+
+	// Each should get exactly 50 with round-robin
+	if a != 50 || b != 50 {
+		t.Errorf("Round-robin not balanced: A=%d B=%d (expected 50/50)", a, b)
+	}
+}
+
+func TestRoundRobinWeightedDistribution(t *testing.T) {
+	countCanary := &atomic.Int64{}
+	countMainnet := &atomic.Int64{}
+
+	canary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		countCanary.Add(1)
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(canary.Close)
+
+	mainnet := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		countMainnet.Add(1)
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(mainnet.Close)
+
+	svc := newTestProxyService(t)
+	// Weight 2:4 = canary gets 1/3, mainnet gets 2/3
+	rules := map[string][]ProxyRule{
+		"test": {
+			{ProxyTo: canary.URL, Weight: 1},
+			{ProxyTo: canary.URL, Weight: 1},
+			{ProxyTo: mainnet.URL, Weight: 1},
+			{ProxyTo: mainnet.URL, Weight: 1},
+			{ProxyTo: mainnet.URL, Weight: 1},
+			{ProxyTo: mainnet.URL, Weight: 1},
+		},
+	}
+	injectRules(svc, rules)
+
+	router := svc.Router()
+
+	// Send 600 requests (divisible by 6 for clean distribution)
+	for i := 0; i < 600; i++ {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.Host = "test.api.pocket.network"
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+	}
+
+	c := countCanary.Load()
+	m := countMainnet.Load()
+	t.Logf("Canary: %d (%.1f%%), Mainnet: %d (%.1f%%)", c, float64(c)/6, m, float64(m)/6)
+
+	// With weight 2:4, canary should get 200 (33%) and mainnet 400 (67%)
+	if c != 200 || m != 400 {
+		t.Errorf("Weighted round-robin broken: canary=%d mainnet=%d (expected 200/400)", c, m)
+	}
+}

@@ -3,7 +3,6 @@ module github.com/pokt-network/taiji
 go 1.25.8
 
 require (
-	atomicgo.dev/robin v0.1.0
 	github.com/alitto/pond v1.9.2
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/prometheus/client_golang v1.23.2
