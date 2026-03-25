@@ -1813,6 +1813,12 @@ func (s *ProxyService) createReverseProxy() *httputil.ReverseProxy {
 				pr.Out.URL.RawQuery = meta.originalQuery
 			}
 
+			// Strip internal-only headers that external callers must not control.
+			// Target-Suppliers allows bypassing reputation filtering; App-Address
+			// allows specifying which application address to use in delegated mode.
+			pr.Out.Header.Del("Target-Suppliers")
+			pr.Out.Header.Del("App-Address")
+
 			// Apply extra headers from backend config (except Host which was already set)
 			for k, v := range meta.rule.ExtraHeaders {
 				if k == "Host" {
