@@ -1871,6 +1871,17 @@ func (s *ProxyService) createReverseProxy() *httputil.ReverseProxy {
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
+			// Client disconnected — not a backend error, skip passive health check
+			if errors.Is(err, context.Canceled) {
+				if meta, ok := req.Context().Value(proxyMetadataField).(proxyMetadata); ok {
+					if mctx, ok := req.Context().Value(metricsContextKey).(*metricsContext); ok {
+						mctx.backend = meta.backend
+						mctx.statusCode = 499
+					}
+				}
+				return
+			}
+
 			// Get metadata from context
 			if meta, ok := req.Context().Value(proxyMetadataField).(proxyMetadata); ok {
 				log.Printf("ERROR: Backend request failed for subdomain '%s' backend '%s': %v", meta.subdomain, meta.backend, err)
