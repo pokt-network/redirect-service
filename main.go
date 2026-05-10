@@ -1300,7 +1300,7 @@ func (s *ProxyService) isBackendHealthy(subdomain, backendURL string) bool {
 
 // filterHealthyBackends returns only the healthy backends from a list
 func (s *ProxyService) filterHealthyBackends(subdomain string, backends []ProxyRule) []ProxyRule {
-	var healthy []ProxyRule
+	healthy := make([]ProxyRule, 0, len(backends))
 	for _, backend := range backends {
 		if s.isBackendHealthy(subdomain, backend.ProxyTo) {
 			healthy = append(healthy, backend)
