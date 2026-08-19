@@ -30,3 +30,6 @@ Thumbs.db
 /proxies.csv
 /proxies.yaml
 /proxies.yaml.backup
+
+# Bare `go build` output at repo root
+/taiji
