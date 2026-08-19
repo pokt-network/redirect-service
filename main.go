@@ -339,6 +339,16 @@ type RateLimiter struct {
 // rateLimitScript is an atomic Lua script for sliding window rate limiting.
 // It checks the count BEFORE adding the request, so blocked requests don't consume budget.
 // Running as a Lua script ensures atomicity across multiple Taiji pods sharing the same Redis.
+//
+// Return contract: the number of requests in the window INCLUDING this one when
+// the request is allowed (1..limit), or -1 when the window is full.
+//
+// The -1 sentinel is load-bearing. An earlier version returned the count clamped
+// at `limit` — because a full window skips the ZADD, `count` could never exceed
+// `limit`, so the caller's `count <= limit` test was true even at capacity and
+// the limiter never blocked a single request in production. "At capacity" and
+// "exactly full but allowed" are indistinguishable from a count alone; they have
+// to be different return values.
 var rateLimitScript = redis.NewScript(`
 local key = KEYS[1]
 local now = tonumber(ARGV[1])
@@ -352,16 +362,19 @@ redis.call('ZREMRANGEBYSCORE', key, '0', window_start)
 -- Count current requests in window
 local count = redis.call('ZCARD', key)
 
--- Only add if under limit (blocked requests don't consume budget)
-if count < limit then
-    redis.call('ZADD', key, now, now)
-    count = count + 1
+-- At or over the limit: reject without consuming budget. Refresh the TTL anyway
+-- so a saturated key still expires once traffic stops.
+if count >= limit then
+    redis.call('EXPIRE', key, ttl)
+    return -1
 end
+
+redis.call('ZADD', key, now, now)
 
 -- Set TTL for memory cleanup
 redis.call('EXPIRE', key, ttl)
 
-return count
+return count + 1
 `)
 
 // CheckLimit checks if the request is within rate limit using sliding window algorithm.
@@ -396,15 +409,20 @@ func (rl *RateLimiter) CheckLimit(ctx context.Context, ip, subdomain string, lim
 		return false, 0, time.Time{}, fmt.Errorf("redis rate limit script error: %w", err)
 	}
 
+	resetAt := now.Add(window)
+
+	// Negative count is the script's explicit "window full" sentinel. Do not
+	// re-derive this from the count: see the rateLimitScript comment.
+	if count < 0 {
+		return false, 0, resetAt, nil
+	}
+
 	remaining := limit - int(count)
 	if remaining < 0 {
 		remaining = 0
 	}
 
-	resetAt := now.Add(window)
-	allowed := count <= int64(limit)
-
-	return allowed, remaining, resetAt, nil
+	return true, remaining, resetAt, nil
 }
 
 type proxyMetadata struct {
