@@ -1234,3 +1234,84 @@ func TestRoundRobinWeightedDistribution(t *testing.T) {
 		t.Errorf("Weighted round-robin broken: canary=%d mainnet=%d (expected 200/400)", c, m)
 	}
 }
+
+// === Hot-path benchmarks ===
+
+// discardResponseWriter is a minimal http.ResponseWriter that throws the response
+// away, so a benchmark measures the proxy path rather than the recorder.
+type discardResponseWriter struct{ header http.Header }
+
+func (d *discardResponseWriter) Header() http.Header         { return d.header }
+func (d *discardResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
+func (d *discardResponseWriter) WriteHeader(int)             {}
+
+// benchProxyService wires a service with two live backends under one subdomain.
+func benchProxyService(b *testing.B) (*ProxyService, func()) {
+	b.Helper()
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	first := httptest.NewServer(handler)
+	second := httptest.NewServer(handler)
+
+	svc := NewProxyService("examples/proxies.yaml", nil, false, nil, false)
+	injectRules(svc, map[string][]ProxyRule{
+		"bench": {
+			{ProxyTo: first.URL, Weight: 1},
+			{ProxyTo: second.URL, Weight: 1},
+		},
+	})
+
+	return svc, func() {
+		first.Close()
+		second.Close()
+	}
+}
+
+// runProxyBenchmark drives the wrapped handler the way the server does.
+func runProxyBenchmark(b *testing.B, svc *ProxyService) {
+	b.Helper()
+
+	handler := metricsWrapper(http.HandlerFunc(svc.HandleProxy))
+	writer := &discardResponseWriter{header: make(http.Header)}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		req := httptest.NewRequest("GET", "/v1/query", nil)
+		req.Host = "bench.api.pocket.network"
+		clear(writer.header)
+		handler.ServeHTTP(writer, req)
+	}
+}
+
+// BenchmarkHandleProxy covers the default fail-fast path with no health check
+// configured — the common case.
+func BenchmarkHandleProxy(b *testing.B) {
+	svc, cleanup := benchProxyService(b)
+	defer cleanup()
+
+	runProxyBenchmark(b, svc)
+}
+
+// BenchmarkHandleProxyHealthChecked covers the same path for a service that does
+// have health checks configured, so backends are filtered per request.
+func BenchmarkHandleProxyHealthChecked(b *testing.B) {
+	svc, cleanup := benchProxyService(b)
+	defer cleanup()
+
+	hcConfigs := xsync.NewMap[string, *HealthCheckConfig]()
+	hcConfigs.Store("bench", &HealthCheckConfig{Path: "/health", FailureThreshold: 1})
+	svc.healthCheckConfigs.Store(hcConfigs)
+
+	states := xsync.NewMap[string, *BackendHealth]()
+	for _, rule := range svc.GetRules()["bench"] {
+		health := &BackendHealth{}
+		health.healthy.Store(true)
+		states.Store(rule.ProxyTo, health)
+	}
+	svc.healthStates.Store(states)
+
+	runProxyBenchmark(b, svc)
+}

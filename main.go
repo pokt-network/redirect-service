@@ -1298,29 +1298,23 @@ func (s *ProxyService) recordHealthCheckFailure(subdomain, backendURL string, he
 	proxyHealthChecksTotal.WithLabelValues(subdomain, backendURL, "failure").Inc()
 }
 
-// isBackendHealthy checks if a backend is healthy
-// If no health check is configured for the service, always returns true
-func (s *ProxyService) isBackendHealthy(subdomain, backendURL string) bool {
-	// Check if health checks are configured for this service
-	_, hasHealthCheck := s.healthCheckConfigs.Load().Load(subdomain)
-	if !hasHealthCheck {
-		return true // No health check = always healthy
-	}
-
-	// Load health state
-	health, exists := s.healthStates.Load().Load(backendURL)
-	if !exists {
-		return true // No state yet = assume it healthy
-	}
-
-	return health.healthy.Load()
-}
-
-// filterHealthyBackends returns only the healthy backends from a list
+// filterHealthyBackends returns only the healthy backends from a list.
+// A backend counts as healthy when its service has no health check configured,
+// when it has no health state recorded yet, or when its recorded state says so.
+//
+// The health-check lookup is hoisted out of the loop because its result is the
+// same for every backend in the slice. When no health check is configured the
+// input is returned untouched, which keeps the common case allocation-free.
 func (s *ProxyService) filterHealthyBackends(subdomain string, backends []ProxyRule) []ProxyRule {
+	if _, hasHealthCheck := s.healthCheckConfigs.Load().Load(subdomain); !hasHealthCheck {
+		return backends
+	}
+
+	states := s.healthStates.Load()
 	healthy := make([]ProxyRule, 0, len(backends))
 	for _, backend := range backends {
-		if s.isBackendHealthy(subdomain, backend.ProxyTo) {
+		health, exists := states.Load(backend.ProxyTo)
+		if !exists || health.healthy.Load() {
 			healthy = append(healthy, backend)
 		}
 	}
@@ -1548,11 +1542,7 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 	// Get or create a persistent round-robin counter for this subdomain.
 	// The counter is shared across requests so round-robin distribution is maintained,
 	// while the healthy backends slice is rebuilt per-request to exclude unhealthy backends.
-	actual, _ := s.rrCounters.LoadOrStore(subdomain, &atomic.Uint64{})
-	counter := actual.(*atomic.Uint64)
-
-	// Count unique backends for retry-all logic (weights create duplicates)
-	uniqueBackendCount := countUniqueBackends(backends)
+	counter := s.counterFor(subdomain)
 
 	// Streaming requests (WebSocket, gRPC) must use direct proxy - no buffering, no retry
 	// This ensures proper HTTP upgrade handling and streaming semantics
@@ -1560,6 +1550,14 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		rule := nextBackend(backends, counter)
 		s.tryBackendDirect(w, r, subdomain, rule, start, host, clientIP)
 		return
+	}
+
+	// Count unique backends for retry-all logic (weights create duplicates).
+	// Only the retry-all branch reads this, so the map is built lazily: the
+	// fail-fast path is the default and would otherwise allocate one per request.
+	uniqueBackendCount := 0
+	if retryPolicy == "retry-all" {
+		uniqueBackendCount = countUniqueBackends(backends)
 	}
 
 	// Retry-all with multiple backends: use buffered retry logic
@@ -1657,9 +1655,7 @@ func (s *ProxyService) tryBackend(w http.ResponseWriter, r *http.Request, subdom
 	}
 
 	// Get or create a cached proxy for this backend
-	cacheKey := targetURL.Scheme + "://" + targetURL.Host
-	actual, _ := s.proxies.LoadOrStore(cacheKey, s.createReverseProxy())
-	proxy := actual.(*httputil.ReverseProxy)
+	proxy := s.proxyFor(targetURL.Scheme + "://" + targetURL.Host)
 
 	// For retry-all on non-last attempts, we need to capture the response to check status
 	if !isLastAttempt {
@@ -1773,9 +1769,7 @@ func (s *ProxyService) tryBackendDirect(w http.ResponseWriter, r *http.Request, 
 	}
 
 	// Get or create a cached proxy for this backend
-	cacheKey := targetURL.Scheme + "://" + targetURL.Host
-	actual, _ := s.proxies.LoadOrStore(cacheKey, s.createReverseProxy())
-	proxy := actual.(*httputil.ReverseProxy)
+	proxy := s.proxyFor(targetURL.Scheme + "://" + targetURL.Host)
 
 	// Direct proxy - no buffering, supports streaming, WebSocket, gRPC
 	proxy.ServeHTTP(w, r)
@@ -1922,6 +1916,30 @@ func (s *ProxyService) createReverseProxy() *httputil.ReverseProxy {
 		},
 		FlushInterval: -1, // Flush immediately for streaming
 	}
+}
+
+// proxyFor returns the cached ReverseProxy for a backend, building one only on a
+// cache miss. The Load must come before LoadOrStore: LoadOrStore evaluates its
+// value argument eagerly, so passing createReverseProxy() directly would build a
+// ReverseProxy — struct, three closures and a BufferPool — on every request and
+// immediately discard it.
+func (s *ProxyService) proxyFor(cacheKey string) *httputil.ReverseProxy {
+	if cached, ok := s.proxies.Load(cacheKey); ok {
+		return cached.(*httputil.ReverseProxy)
+	}
+	actual, _ := s.proxies.LoadOrStore(cacheKey, s.createReverseProxy())
+	return actual.(*httputil.ReverseProxy)
+}
+
+// counterFor returns the shared round-robin counter for a subdomain, allocating
+// one only on a cache miss. Load before LoadOrStore for the same reason as
+// proxyFor: the eagerly evaluated argument would otherwise allocate per request.
+func (s *ProxyService) counterFor(subdomain string) *atomic.Uint64 {
+	if cached, ok := s.rrCounters.Load(subdomain); ok {
+		return cached.(*atomic.Uint64)
+	}
+	actual, _ := s.rrCounters.LoadOrStore(subdomain, &atomic.Uint64{})
+	return actual.(*atomic.Uint64)
 }
 
 // nextBackend picks the next backend from the slice using a shared atomic counter.
