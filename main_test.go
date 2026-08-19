@@ -1315,3 +1315,99 @@ func BenchmarkHandleProxyHealthChecked(b *testing.B) {
 
 	runProxyBenchmark(b, svc)
 }
+
+// === HTTP/2 cleartext (h2c) ===
+
+// startTestServer serves the given handler through newHTTPServer on a random
+// local port, so the test exercises the same protocol configuration as main().
+func startTestServer(t *testing.T, handler http.Handler) string {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+
+	srv := newHTTPServer(ln.Addr().String(), handler)
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	return "http://" + ln.Addr().String()
+}
+
+// TestH2CPriorKnowledge verifies that a client sending the HTTP/2 preface over
+// cleartext — what gRPC does — is served over HTTP/2 and proxied correctly.
+// This is the behavior the deprecated x/net/http2/h2c wrapper used to provide.
+func TestH2CPriorKnowledge(t *testing.T) {
+	backend, backendCount := newTestBackend(t, 200)
+
+	svc := newTestProxyService(t)
+	injectRules(svc, map[string][]ProxyRule{
+		"h2c": {{ProxyTo: backend.URL, Weight: 1}},
+	})
+
+	addr := startTestServer(t, svc.Router())
+
+	protocols := new(http.Protocols)
+	protocols.SetUnencryptedHTTP2(true)
+	client := &http.Client{Transport: &http.Transport{Protocols: protocols}}
+
+	req, err := http.NewRequest("GET", addr+"/v1/query", nil)
+	if err != nil {
+		t.Fatalf("Failed to build request: %v", err)
+	}
+	req.Host = "h2c.api.pocket.network"
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("h2c request failed: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.ProtoMajor != 2 {
+		t.Errorf("Expected the response to be served over HTTP/2, got HTTP/%d.%d", resp.ProtoMajor, resp.ProtoMinor)
+	}
+	if resp.StatusCode != 200 {
+		t.Errorf("Expected status 200, got %d", resp.StatusCode)
+	}
+	if backendCount.Load() != 1 {
+		t.Errorf("Expected the backend to receive 1 request, got %d", backendCount.Load())
+	}
+}
+
+// TestHTTP1StillServedOnSamePort verifies that enabling h2c did not break plain
+// HTTP/1.1 clients, which share the port with gRPC traffic.
+func TestHTTP1StillServedOnSamePort(t *testing.T) {
+	backend, backendCount := newTestBackend(t, 200)
+
+	svc := newTestProxyService(t)
+	injectRules(svc, map[string][]ProxyRule{
+		"h2c": {{ProxyTo: backend.URL, Weight: 1}},
+	})
+
+	addr := startTestServer(t, svc.Router())
+
+	req, err := http.NewRequest("GET", addr+"/v1/query", nil)
+	if err != nil {
+		t.Fatalf("Failed to build request: %v", err)
+	}
+	req.Host = "h2c.api.pocket.network"
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("HTTP/1.1 request failed: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.ProtoMajor != 1 {
+		t.Errorf("Expected the response to be served over HTTP/1.x, got HTTP/%d.%d", resp.ProtoMajor, resp.ProtoMinor)
+	}
+	if resp.StatusCode != 200 {
+		t.Errorf("Expected status 200, got %d", resp.StatusCode)
+	}
+	if backendCount.Load() != 1 {
+		t.Errorf("Expected the backend to receive 1 request, got %d", backendCount.Load())
+	}
+}

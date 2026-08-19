@@ -35,7 +35,6 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/robfig/cron/v3"
 	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 	"gopkg.in/yaml.v3"
 )
 
@@ -1977,6 +1976,41 @@ func countUniqueBackends(backends []ProxyRule) int {
 	return len(seen)
 }
 
+// newHTTPServer builds the listening server with settings deliberately generous
+// for streaming and long-running requests, since we control neither the backends
+// nor the clients.
+//
+// HTTP/1.1 and HTTP/2 cleartext (h2c) are served on the same port, which gRPC
+// clients need. This uses the stdlib Protocols field rather than the deprecated
+// golang.org/x/net/http2/h2c wrapper. The stdlib serves h2c to clients that send
+// the HTTP/2 preface directly (prior knowledge), which is what gRPC does; it does
+// not implement the older "Upgrade: h2c" handshake that the x/net wrapper also
+// accepted, and which no mainstream client relies on.
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	protocols.SetHTTP2(true)
+	protocols.SetUnencryptedHTTP2(true)
+
+	return &http.Server{
+		Addr:      addr,
+		Handler:   handler,
+		Protocols: protocols,
+		// ReadTimeout covers: time to read request headers + body
+		// Set to 0 to support long-running uploads (e.g., large file uploads, streaming requests)
+		ReadTimeout: 0,
+		// ReadHeaderTimeout prevents Slowloris attacks while allowing streaming body
+		ReadHeaderTimeout: 30 * time.Second,
+		// WriteTimeout covers: time to write response
+		// Set to 0 to support long-running responses (e.g., SSE, large downloads, streaming)
+		WriteTimeout: 0,
+		// IdleTimeout for keep-alive connections
+		IdleTimeout: 120 * time.Second,
+		// MaxHeaderBytes prevents huge headers (64KB is sufficient for most proxied traffic)
+		MaxHeaderBytes: 64 * 1024, // 64KB
+	}
+}
+
 // HandleHealth health check endpoint
 func (s *ProxyService) HandleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
@@ -2446,29 +2480,7 @@ func main() {
 	// Start the config file watcher with auto-restart
 	service.StartWatcherWithRestart(ctx)
 
-	// Configure HTTP server with VERY generous settings for streaming/long-running requests
-	// We don't control what backends or clients expect, so timeouts are minimal
-
-	// Wrap handler with h2c (HTTP/2 cleartext) support for gRPC
-	// This allows both HTTP/1.1 and HTTP/2 on the same port
-	h2cHandler := h2c.NewHandler(service.Router(), &http2.Server{})
-
-	server := &http.Server{
-		Addr:    ":" + port,
-		Handler: h2cHandler,
-		// ReadTimeout covers: time to read request headers + body
-		// Set to 0 to support long-running uploads (e.g., large file uploads, streaming requests)
-		ReadTimeout: 0,
-		// ReadHeaderTimeout prevents Slowloris attacks while allowing streaming body
-		ReadHeaderTimeout: 30 * time.Second,
-		// WriteTimeout covers: time to write response
-		// Set to 0 to support long-running responses (e.g., SSE, large downloads, streaming)
-		WriteTimeout: 0,
-		// IdleTimeout for keep-alive connections
-		IdleTimeout: 120 * time.Second,
-		// MaxHeaderBytes prevents huge headers (64KB is sufficient for most proxied traffic)
-		MaxHeaderBytes: 64 * 1024, // 64KB
-	}
+	server := newHTTPServer(":"+port, service.Router())
 
 	// Handle a graceful shutdown
 	sigChan := make(chan os.Signal, 1)
