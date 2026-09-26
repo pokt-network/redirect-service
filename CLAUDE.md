@@ -71,7 +71,7 @@ make docker-buildx
 ## Architecture
 
 ### Single-File Design
-All application logic lives in `main.go` (~2,300 lines). This is intentional for simplicity and performance. There are no separate packages or subdirectories for core logic. Tests live in `main_test.go`.
+All application logic lives in `main.go`. This is intentional for simplicity and performance. There are no separate packages or subdirectories for core logic. Tests live in `main_test.go` and `ratelimit_test.go`.
 
 ### Core Components
 
@@ -83,10 +83,9 @@ All application logic lives in `main.go` (~2,300 lines). This is intentional for
 - Backends can have weights for load balancing (weight=3 means 3x traffic)
 
 **Load Balancing**
-- Round-robin using `atomicgo.dev/robin` package
-- Per-request loadbalancers built from healthy backends only (unhealthy backends never receive traffic)
+- Round-robin via a persistent per-subdomain atomic counter (`counterFor` / `nextBackend`)
+- Healthy-backend slice rebuilt per request (unhealthy backends never receive traffic); the counter is shared across requests so distribution holds
 - Weight-based distribution via entry duplication (weight=3 creates 3 entries)
-- Health-filtered LBs ensure retry loops don't distort distribution for concurrent requests
 
 **Health Checking (Dual-Mode)**
 - **Active checks**: Cron-based (every 10s), configurable HTTP method/payload/timeout/failure threshold
@@ -131,10 +130,8 @@ All application logic lives in `main.go` (~2,300 lines). This is intentional for
 ### Performance Optimizations
 - **Zero-copy streaming**: `FlushInterval: -1` for immediate flushing
 - **Connection pooling**: 1000 idle conns per host, optimized TCP buffers (128KB)
-- **HTTP/2 tuning**: 256KB frame size (vs default 16KB)
 - **Buffer pooling**: `sync.Pool` for httputil.ReverseProxy buffers
 - **Pre-allocated strings**: Status code strings and health response bytes to avoid allocations
-- **Pre-compiled regex**: Forwarded header regex compiled once at package level
 - **Zero-alloc subdomain extraction**: `strings.IndexByte` instead of `strings.Split`
 - **Cached backend normalization**: `normalizeBackendLabel` results cached in `sync.Map`
 - **String concatenation**: Hot-path key building uses `+` instead of `fmt.Sprintf`
@@ -147,13 +144,13 @@ Request -> metricsWrapper middleware
   -> Lookup backends for subdomain
   -> Filter to healthy backends only
   -> Try fallback backends if all primaries unhealthy
-  -> Build per-request loadbalancer from healthy backends
+  -> Get shared round-robin counter for subdomain
   -> Check rate limit (Redis Lua script)
   -> Select backend via round-robin
   -> [If streaming] -> Direct proxy (no buffering)
   -> [If retry-all] -> Buffer with httptest.NewRecorder, retry on 5xx/429
   -> [Default] -> Direct proxy (zero-copy)
-  -> ReverseProxy (Director, ModifyResponse, ErrorHandler)
+  -> ReverseProxy (Rewrite, ModifyResponse, ErrorHandler)
   -> Record metrics in deferred function
 ```
 
@@ -190,7 +187,7 @@ The client `Retry-Policy` header is ignored to prevent DoS amplification attacks
 ## Testing Strategy
 
 Testing uses both Go unit tests and shell script integration tests:
-1. **Go unit tests**: `main_test.go` — validates critical bugs (health filtering, retry logic, data races, route matching, IP extraction)
+1. **Go unit tests**: `main_test.go` and `ratelimit_test.go` — validate critical bugs (health filtering, retry logic, data races, route matching, IP extraction, rate limiting)
 2. **Shell script integration tests**: `test.sh`, `test-health.sh`, `test-distributed.sh`, `test-stage.sh`
 3. **Docker Compose**: Multi-service testing with httpbin, redis, HAProxy
 4. **Prometheus metrics**: Runtime observability
@@ -199,8 +196,9 @@ Testing uses both Go unit tests and shell script integration tests:
 Always run `go test -race` to catch data races.
 
 ## Key Files
-- `main.go`: All application logic (~2,300 lines)
+- `main.go`: All application logic
 - `main_test.go`: Go unit tests and benchmarks
+- `ratelimit_test.go`: Rate limiter tests
 - `examples/proxies.yaml`: Configuration example
 - `Dockerfile`: Container build
 - `docker-compose.yml`: Multi-service test environment
@@ -212,12 +210,11 @@ Always run `go test -race` to catch data races.
 All managed via `go.mod`:
 - `fsnotify/fsnotify`: File watching for hot reload
 - `prometheus/client_golang`: Metrics
-- `atomicgo.dev/robin`: Round-robin load balancing
 - `alitto/pond`: Worker pool for health checks
 - `redis/go-redis`: Redis client for rate limiting
 - `robfig/cron`: Cron scheduler for health checks
 - `puzpuzpuz/xsync`: Lock-free concurrent maps
-- `golang.org/x/net/http2`: HTTP/2 and h2c support
+- `golang.org/x/net/http2`: HTTP/2 transport to backends
 - `gopkg.in/yaml.v3`: YAML parsing
 
 ## Important Implementation Details
@@ -234,7 +231,7 @@ All managed via `go.mod`:
 
 **WebSocket/gRPC Support**: Detected via `Upgrade: websocket` header or `Content-Type: application/grpc`. These bypass retry logic and use direct proxy with hijacking support.
 
-**HTTP/2 Cleartext**: h2c handler wraps the router to support both HTTP/1.1 and HTTP/2 on the same port (needed for gRPC).
+**HTTP/2 Cleartext**: `http.Server.Protocols` with `SetUnencryptedHTTP2(true)` serves HTTP/1.1 and h2c on the same port (needed for gRPC). Prior-knowledge h2c only; the `Upgrade: h2c` handshake is not supported.
 
 **Graceful Shutdown**: Handles SIGINT/SIGTERM, stops health checker (cron + worker pool), shuts down server with 30s timeout, cancels file watcher context.
 
