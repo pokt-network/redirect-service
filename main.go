@@ -17,7 +17,6 @@ import (
 	"os"
 	"os/signal"
 	"path"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -52,9 +51,6 @@ const (
 	// buffered during retry-all mode. Prevents OOM from malicious/misconfigured backends.
 	maxRetryResponseSize = 128 << 20
 )
-
-// Pre-compiled regex for Forwarded header parsing (avoid compiling per request)
-var forwardedForRegex = regexp.MustCompile(`for=([^;,\s]+)`)
 
 // Pre-allocated byte slices for health/readiness responses (avoid per-probe allocation)
 var (
@@ -482,102 +478,72 @@ func parseTrustedProxyCIDRs(cidrsStr string) []*net.IPNet {
 	return nets
 }
 
-// isFromTrustedProxy checks if the remote address is within any trusted proxy CIDR.
-func isFromTrustedProxy(remoteAddr string, trustedCIDRs []*net.IPNet) bool {
-	ip, _, _ := net.SplitHostPort(remoteAddr)
-	if ip == "" {
-		ip = remoteAddr
+// extractClientIP resolves the client a request is attributed to, for rate
+// limiting and for the X-Forwarded-For / X-Real-IP / Forwarded headers sent to
+// backends.
+//
+// Only X-Forwarded-For is read, walked from the RIGHT: each proxy appends the
+// address it received the connection from, so the rightmost entries were
+// written by the hops nearest us and cannot be forged by the client. The first
+// address that is not itself a trusted proxy is the client. Taking the leftmost
+// entry, or honouring Forwarded / CF-Connecting-IP / True-Client-IP, lets any
+// client name itself: the ingress in front of Taiji strips a client-supplied
+// X-Forwarded-For but passes those other headers through untouched, so a
+// client could set one to a fresh address per request and walk past the rate
+// limiter (and the per-client accounting of every backend behind us). A CDN
+// in front appends to X-Forwarded-For as well, so nothing is lost by reading
+// only it.
+//
+// Trusted proxies are trustedProxyCIDRs when set. When unset, private and
+// loopback addresses are treated as proxies: in-cluster hops are never the
+// client, and a public address is.
+//
+// When trustProxy is false, or the direct peer is not a trusted proxy, headers
+// are ignored and the peer is the client.
+func extractClientIP(r *http.Request, trustProxy bool, trustedProxyCIDRs ...[]*net.IPNet) string {
+	peer, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if peer == "" {
+		peer = r.RemoteAddr
 	}
-	parsed := net.ParseIP(ip)
-	if parsed == nil {
+	if !trustProxy {
+		return peer
+	}
+
+	var cidrs []*net.IPNet
+	if len(trustedProxyCIDRs) > 0 {
+		cidrs = trustedProxyCIDRs[0]
+	}
+	trusted := func(ip net.IP) bool {
+		if len(cidrs) == 0 {
+			return ip.IsPrivate() || ip.IsLoopback()
+		}
+		for _, cidr := range cidrs {
+			if cidr.Contains(ip) {
+				return true
+			}
+		}
 		return false
 	}
-	for _, cidr := range trustedCIDRs {
-		if cidr.Contains(parsed) {
-			return true
-		}
-	}
-	return false
-}
 
-// extractClientIP extracts the real client IP from request headers.
-// When trustedProxyCIDRs is set, proxy headers are only trusted if the direct
-// connection comes from a known proxy IP. This prevents IP spoofing.
-// Priority: Forwarded (RFC 7239) > CF-Connecting-IP > True-Client-IP > X-Forwarded-For > X-Real-IP > RemoteAddr
-func extractClientIP(r *http.Request, trustProxy bool, trustedProxyCIDRs ...[]*net.IPNet) string {
-	if !trustProxy {
-		// In development or when not behind a proxy, use RemoteAddr directly
-		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
-		if ip == "" {
-			return r.RemoteAddr
-		}
-		return ip
+	peerIP := net.ParseIP(peer)
+	if peerIP == nil || !trusted(peerIP) {
+		return peer
 	}
 
-	// If trusted CIDRs are configured, only trust headers from known proxies
-	if len(trustedProxyCIDRs) > 0 && len(trustedProxyCIDRs[0]) > 0 {
-		if !isFromTrustedProxy(r.RemoteAddr, trustedProxyCIDRs[0]) {
-			// Not from a trusted proxy — use RemoteAddr directly (ignore spoofable headers)
-			ip, _, _ := net.SplitHostPort(r.RemoteAddr)
-			if ip == "" {
-				return r.RemoteAddr
-			}
-			return ip
-		}
-	}
-
-	// 1. Check RFC 7239 Forwarded header (standard)
-	if forwarded := r.Header.Get("Forwarded"); forwarded != "" {
-		// Parse "for=xxx" from Forwarded header
-		// Example: "for=192.0.2.60;host=example.com;proto=https"
-		if matches := forwardedForRegex.FindStringSubmatch(forwarded); len(matches) > 1 {
-			ip := strings.Trim(matches[1], "\"[]")
-			if validIP := net.ParseIP(ip); validIP != nil {
-				return ip
+	xff := r.Header.Values("X-Forwarded-For")
+	for i := len(xff) - 1; i >= 0; i-- {
+		parts := strings.Split(xff[i], ",")
+		for j := len(parts) - 1; j >= 0; j-- {
+			ip := net.ParseIP(strings.TrimSpace(parts[j]))
+			if ip != nil && !trusted(ip) {
+				return ip.String()
 			}
 		}
 	}
 
-	// 2. Check Cloudflare headers (no X- prefix, modern standard)
-	if cfIP := r.Header.Get("CF-Connecting-IP"); cfIP != "" {
-		if validIP := net.ParseIP(cfIP); validIP != nil {
-			return cfIP
-		}
-	}
-
-	if trueClientIP := r.Header.Get("True-Client-IP"); trueClientIP != "" {
-		if validIP := net.ParseIP(trueClientIP); validIP != nil {
-			return trueClientIP
-		}
-	}
-
-	// 3. Check X-Forwarded-For (legacy but widely used)
-	// Format: "client, proxy1, proxy2"
-	// Take the rightmost IP that's not a known proxy (or just the first IP for simplicity)
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		ips := strings.Split(xff, ",")
-		// Take the first IP (original client) after trimming
-		if len(ips) > 0 {
-			ip := strings.TrimSpace(ips[0])
-			if validIP := net.ParseIP(ip); validIP != nil {
-				return ip
-			}
-		}
-	}
-
-	// 4. Check X-Real-IP (legacy)
-	if xRealIP := r.Header.Get("X-Real-IP"); xRealIP != "" {
-		if validIP := net.ParseIP(xRealIP); validIP != nil {
-			return xRealIP
-		}
-	}
-
-	// 5. Fallback to RemoteAddr
-	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
-	if ip == "" {
-		return r.RemoteAddr
-	}
-	return ip
+	// Every hop was a proxy (or there was no header): the nearest real
+	// address we have is the peer.
+	return peer
 }
 
 // normalizeBackendLabel extracts a normalized backend identifier from a full backend URL
@@ -1860,11 +1826,10 @@ func (s *ProxyService) createReverseProxy() *httputil.ReverseProxy {
 				forHost = "\"" + forHost + "\""
 			}
 			forwardedValue := "for=" + forIP + ";host=" + forHost + ";proto=" + meta.scheme
-			if prior, ok := pr.In.Header["Forwarded"]; ok {
-				pr.Out.Header.Set("Forwarded", strings.Join(prior, ", ")+", "+forwardedValue)
-			} else {
-				pr.Out.Header.Set("Forwarded", forwardedValue)
-			}
+			// Not appended to an incoming Forwarded: extractClientIP does not
+			// trust it, so a prior value is whatever the client wrote, and a
+			// backend reading the first for= would believe it.
+			pr.Out.Header.Set("Forwarded", forwardedValue)
 		},
 		Transport:  s.transport,
 		BufferPool: &BufferPool{}, // Reuse buffers across requests (reduces allocations & GC pressure)

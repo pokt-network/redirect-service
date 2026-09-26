@@ -208,7 +208,8 @@ func TestBug3_HealthRouteMismatch(t *testing.T) {
 
 func BenchmarkBug4_ExtractClientIPRegex(b *testing.B) {
 	req := httptest.NewRequest("GET", "/", nil)
-	req.Header.Set("Forwarded", "for=192.0.2.60;host=example.com;proto=https")
+	req.RemoteAddr = "10.42.0.7:40000"
+	req.Header.Set("X-Forwarded-For", "192.0.2.60")
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -417,6 +418,74 @@ func TestBug15_IPSpoofingWithTrustedCIDRs(t *testing.T) {
 	ipUntrusted := extractClientIP(reqUntrusted, true, trustedCIDRs)
 	if ipUntrusted != "203.0.113.50" {
 		t.Errorf("From untrusted source: expected RemoteAddr 203.0.113.50, got %s (spoofed!)", ipUntrusted)
+	}
+}
+
+// A client must not be able to name itself. The ingress strips a client's
+// X-Forwarded-For and writes the real source, but passes Forwarded,
+// CF-Connecting-IP and True-Client-IP through untouched — so none of them may
+// be believed, and neither may the leftmost X-Forwarded-For entry.
+func TestExtractClientIP_ClientCannotSpoof(t *testing.T) {
+	const real = "198.51.100.23"
+	cidrs := parseTrustedProxyCIDRs("10.42.0.0/16")
+
+	for _, tc := range []struct {
+		name   string
+		header string
+		value  string
+		xff    string
+	}{
+		{"Forwarded", "Forwarded", "for=1.2.3.4", real},
+		{"CF-Connecting-IP", "CF-Connecting-IP", "1.2.3.4", real},
+		{"True-Client-IP", "True-Client-IP", "1.2.3.4", real},
+		{"X-Real-IP", "X-Real-IP", "1.2.3.4", real},
+		// A client that reaches us through a proxy which appends rather than
+		// strips: its own entry is on the left, the proxy's on the right.
+		{"leftmost X-Forwarded-For", "", "", "1.2.3.4, " + real},
+	} {
+		for _, withCIDRs := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/cidrs=%v", tc.name, withCIDRs), func(t *testing.T) {
+				req := httptest.NewRequest("GET", "/", nil)
+				req.RemoteAddr = "10.42.3.9:51234" // the ingress pod
+				req.Header.Set("X-Forwarded-For", tc.xff)
+				if tc.header != "" {
+					req.Header.Set(tc.header, tc.value)
+				}
+				var got string
+				if withCIDRs {
+					got = extractClientIP(req, true, cidrs)
+				} else {
+					got = extractClientIP(req, true)
+				}
+				if got != real {
+					t.Errorf("client IP = %s, want %s", got, real)
+				}
+			})
+		}
+	}
+}
+
+// Proxy hops are skipped from the right; with no CIDRs configured, private and
+// loopback addresses are the hops.
+func TestExtractClientIP_SkipsProxyHops(t *testing.T) {
+	req := httptest.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "127.0.0.1:9000"
+	req.Header.Set("X-Forwarded-For", "203.0.113.8, 10.1.2.3")
+	req.Header.Add("X-Forwarded-For", "10.42.0.5")
+	if got := extractClientIP(req, true); got != "203.0.113.8" {
+		t.Errorf("client IP = %s, want 203.0.113.8", got)
+	}
+
+	// No header, or nothing but proxies: the peer is the best answer.
+	bare := httptest.NewRequest("GET", "/", nil)
+	bare.RemoteAddr = "10.42.0.5:1"
+	if got := extractClientIP(bare, true); got != "10.42.0.5" {
+		t.Errorf("no header: client IP = %s, want the peer", got)
+	}
+
+	// trustProxy off: headers are never read.
+	if got := extractClientIP(req, false); got != "127.0.0.1" {
+		t.Errorf("trustProxy=false: client IP = %s, want the peer", got)
 	}
 }
 
@@ -762,6 +831,45 @@ func TestRewriteAPIHeaderSafety(t *testing.T) {
 	// With Rewrite API, X-Forwarded-For should still be present at the backend
 	if receivedHeaders.Get("X-Forwarded-For") == "" {
 		t.Error("X-Forwarded-For was stripped by hop-by-hop Connection header — Rewrite API should prevent this")
+	}
+}
+
+// What a backend behind Taiji is told about the client, when the request
+// came through the ingress with spoofed identity headers riding along. The
+// backend must see the real client in every header it might read, and no
+// client-written Forwarded entry ahead of it.
+func TestProxyForwardsRealClientToBackend(t *testing.T) {
+	var got http.Header
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(backend.Close)
+
+	svc := NewProxyService("examples/proxies.yaml", nil, false, nil, true)
+	injectRules(svc, map[string][]ProxyRule{"test": {{ProxyTo: backend.URL, Weight: 1}}})
+
+	const real = "198.51.100.23"
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Host = "test.api.pocket.network"
+	req.RemoteAddr = "10.42.3.9:51234" // the ingress pod
+	req.Header.Set("X-Forwarded-For", real)
+	req.Header.Set("CF-Connecting-IP", "1.2.3.4")
+	req.Header.Set("Forwarded", "for=1.2.3.4")
+	svc.Router().ServeHTTP(httptest.NewRecorder(), req)
+
+	if got == nil {
+		t.Fatal("backend was not reached")
+	}
+	xff := strings.Split(got.Get("X-Forwarded-For"), ",")
+	if last := strings.TrimSpace(xff[len(xff)-1]); last != real {
+		t.Errorf("X-Forwarded-For = %q, want %s as the rightmost entry", got.Get("X-Forwarded-For"), real)
+	}
+	if got.Get("X-Real-IP") != real {
+		t.Errorf("X-Real-IP = %q, want %s", got.Get("X-Real-IP"), real)
+	}
+	if fwd := got.Get("Forwarded"); !strings.HasPrefix(fwd, "for="+real+";") || strings.Contains(fwd, "1.2.3.4") {
+		t.Errorf("Forwarded = %q, want only Taiji's own entry for %s", fwd, real)
 	}
 }
 

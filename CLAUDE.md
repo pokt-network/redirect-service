@@ -165,7 +165,7 @@ Request -> metricsWrapper middleware
 - `RATE_LIMIT_ENABLED`: Enable rate limiting (default: `true`)
 - `RATE_LIMIT_DEFAULT`: Default rate limit (default: `100/1m`)
 - `RATE_LIMIT_TRUST_PROXY`: Trust proxy headers for IP extraction (default: `true`)
-- `TRUSTED_PROXY_CIDRS`: Comma-separated CIDRs for trusted proxies (e.g., `10.0.0.0/8,172.16.0.0/12`). When set, proxy headers like `X-Forwarded-For` are only trusted from these source IPs. When unset, all sources are trusted (backward compatible).
+- `TRUSTED_PROXY_CIDRS`: Comma-separated CIDRs for trusted proxies (e.g., `10.0.0.0/8,172.16.0.0/12`). `X-Forwarded-For` is only read from these source IPs, and these hops are skipped when walking it. When unset, private and loopback addresses are the trusted proxies.
 - `REDIS_ADDR`: Redis address (default: `localhost:6379`)
 - `REDIS_PASSWORD`: Redis password (optional)
 - `REDIS_DB`: Redis database number (default: `0`)
@@ -228,7 +228,7 @@ All managed via `go.mod`:
 
 **Path/Query Handling**: `strip_path` and `strip_query` flags control how incoming paths/queries are forwarded. Backend URLs can include paths that are joined with incoming paths.
 
-**Client IP Extraction**: Priority order: `Forwarded` (RFC 7239) -> `CF-Connecting-IP` -> `True-Client-IP` -> `X-Forwarded-For` -> `X-Real-IP` -> `RemoteAddr`. When `TRUSTED_PROXY_CIDRS` is set, headers are only trusted from connections originating from those CIDRs.
+**Client IP Extraction**: Only `X-Forwarded-For` is read, walked from the right: the first address that is not a trusted proxy is the client. Trusted proxies are `TRUSTED_PROXY_CIDRS`, or private/loopback addresses when unset. Headers are read only when the direct peer is itself a trusted proxy; otherwise the peer is the client. `Forwarded`, `CF-Connecting-IP`, `True-Client-IP` and `X-Real-IP` are never trusted (the ingress passes them through from the client), and an incoming `Forwarded` is not propagated to backends.
 
 **Backend Metrics Normalization**: Backend labels extract last 2 domain parts (e.g., "eth.gateway.pocket.network" -> "pocket.network") to reduce cardinality. Results are cached in a `sync.Map`.
 

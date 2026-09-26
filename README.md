@@ -137,7 +137,7 @@ Distributed IP-based rate limiting using Redis with sliding window algorithm:
 **How it works:**
 - Per-IP tracking across all Taiji instances via shared Redis state
 - Sliding window algorithm prevents boundary exploits
-- Extracts real client IP from `Forwarded`, `CF-Connecting-IP`, `X-Forwarded-For`, etc.
+- Extracts the real client IP from `X-Forwarded-For`, walked from the right past trusted proxies (`TRUSTED_PROXY_CIDRS`, or private/loopback addresses when unset). `Forwarded`, `CF-Connecting-IP`, `True-Client-IP` and `X-Real-IP` are not trusted: a client can set them.
 - Returns standard `X-RateLimit-*` headers and `Retry-After` on 429s
 - Fails open if Redis unavailable (allows requests)
 
