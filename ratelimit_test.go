@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"net"
 	"testing"
 	"time"
 
@@ -198,5 +200,57 @@ func TestRateLimiterDisabledAllowsEverything(t *testing.T) {
 		if remaining != 1 {
 			t.Errorf("nil limiter: remaining=%d, want 1 (full budget)", remaining)
 		}
+	}
+}
+
+// TestRateLimiterUnreachableRedisFailsFast pins the 2026-10-02 incident: Redis
+// was black-holed (its node went dark, so connections were never
+// answered), each check blocked on go-redis timeouts and retries, and taiji's
+// "fail open" cost ~30s per request. A check must give up within
+// redisCheckTimeout, and after redisFailuresToSkip consecutive failures later
+// checks must skip Redis entirely.
+func TestRateLimiterUnreachableRedisFailsFast(t *testing.T) {
+	// A listener that accepts connections and never replies stands in for a
+	// Redis whose node has gone dark.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { _ = c.Close() })
+		}
+	}()
+
+	client := newRedisClient(ln.Addr().String(), "", 0)
+	t.Cleanup(func() { _ = client.Close() })
+	rl := &RateLimiter{redis: client}
+	ctx := context.Background()
+
+	// The first redisFailuresToSkip checks each try Redis and give up within
+	// the bound. Fewer failures must not switch rate limiting off.
+	for i := 1; i <= redisFailuresToSkip; i++ {
+		start := time.Now()
+		_, _, _, err := rl.CheckLimit(ctx, "1.2.3.4", "eth", 10, time.Minute)
+		if err == nil || errors.Is(err, errRedisUnavailable) {
+			t.Fatalf("check %d: err=%v, want a Redis timeout", i, err)
+		}
+		if took := time.Since(start); took > 4*redisCheckTimeout {
+			t.Fatalf("check %d took %s, want under %s", i, took, 4*redisCheckTimeout)
+		}
+	}
+
+	start := time.Now()
+	_, _, _, err = rl.CheckLimit(ctx, "1.2.3.4", "eth", 10, time.Minute)
+	if !errors.Is(err, errRedisUnavailable) {
+		t.Fatalf("check after %d failures: err=%v, want errRedisUnavailable", redisFailuresToSkip, err)
+	}
+	if took := time.Since(start); took > 10*time.Millisecond {
+		t.Fatalf("check after %d failures took %s, want Redis skipped", redisFailuresToSkip, took)
 	}
 }

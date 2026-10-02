@@ -329,6 +329,41 @@ type ProxyService struct {
 
 type RateLimiter struct {
 	redis *redis.Client
+	// downUntil (unix nanos) skips Redis after redisFailuresToSkip consecutive
+	// failures, so an unreachable Redis costs one bounded timeout per
+	// redisBackoff instead of one per request. A single slow check (~1/s per
+	// pod exceed 100ms in normal traffic) must not switch rate limiting off.
+	downUntil atomic.Int64
+	failures  atomic.Int32
+}
+
+const (
+	// redisCheckTimeout bounds a single rate limit check, retries included.
+	// A black-holed Redis otherwise blocks each check on dial and pool timeouts
+	// (~15s); with two checks per request that throttled mainnet ~4x on
+	// 2026-10-02 while the limiter was nominally failing open.
+	redisCheckTimeout   = 250 * time.Millisecond
+	redisBackoff        = 5 * time.Second
+	redisFailuresToSkip = 3
+)
+
+// errRedisUnavailable is returned while Redis is being skipped after a failure.
+var errRedisUnavailable = errors.New("redis unavailable, rate limiting skipped")
+
+func newRedisClient(addr, password string, db int) *redis.Client {
+	return redis.NewClient(&redis.Options{
+		Addr:         addr,
+		Password:     password,
+		DB:           db,
+		DialTimeout:  5 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+		PoolSize:     100,
+		MinIdleConns: 10,
+		// Apply the per-check context deadline to socket reads and writes too,
+		// not only to dialing and waiting for a pool connection.
+		ContextTimeoutEnabled: true,
+	})
 }
 
 // rateLimitScript is an atomic Lua script for sliding window rate limiting.
@@ -382,6 +417,13 @@ func (rl *RateLimiter) CheckLimit(ctx context.Context, ip, subdomain string, lim
 		return true, limit, time.Now().Add(window), nil
 	}
 
+	if time.Now().UnixNano() < rl.downUntil.Load() {
+		return false, 0, time.Time{}, errRedisUnavailable
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, redisCheckTimeout)
+	defer cancel()
+
 	// Track Redis latency
 	checkStart := time.Now()
 	defer func() {
@@ -401,8 +443,13 @@ func (rl *RateLimiter) CheckLimit(ctx context.Context, ip, subdomain string, lim
 	).Int64()
 
 	if err != nil {
+		if rl.failures.Add(1) >= redisFailuresToSkip &&
+			rl.downUntil.Swap(time.Now().Add(redisBackoff).UnixNano()) < now.UnixNano() {
+			log.Printf("ERROR: Redis rate limit checks failing, skipping rate limiting for %s: %v", redisBackoff, err)
+		}
 		return false, 0, time.Time{}, fmt.Errorf("redis rate limit script error: %w", err)
 	}
+	rl.failures.Store(0)
 
 	resetAt := now.Add(window)
 
@@ -1402,7 +1449,10 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 
 			if err != nil {
 				// Redis error - log and fail open (allow request)
-				log.Printf("ERROR: Global rate limit check failed for subdomain %s: %v (failing open)", subdomain, err)
+				// errRedisUnavailable was already logged once when Redis failed.
+				if !errors.Is(err, errRedisUnavailable) {
+					log.Printf("ERROR: Global rate limit check failed for subdomain %s: %v (failing open)", subdomain, err)
+				}
 				proxyRateLimitRedisErrorsTotal.Inc()
 			} else if !allowed {
 				// Global rate limit exceeded - return 429
@@ -1449,7 +1499,10 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 
 			if err != nil {
 				// Redis error - log and fail open (allow request)
-				log.Printf("ERROR: Rate limit check failed for IP %s, subdomain %s: %v (failing open)", clientIP, subdomain, err)
+				// errRedisUnavailable was already logged once when Redis failed.
+				if !errors.Is(err, errRedisUnavailable) {
+					log.Printf("ERROR: Rate limit check failed for IP %s, subdomain %s: %v (failing open)", clientIP, subdomain, err)
+				}
 				proxyRateLimitRedisErrorsTotal.Inc()
 			} else {
 				// Add per-IP rate limit headers to response
@@ -2390,16 +2443,7 @@ func main() {
 			}
 		}
 
-		redisClient := redis.NewClient(&redis.Options{
-			Addr:         redisAddr,
-			Password:     redisPassword,
-			DB:           redisDB,
-			DialTimeout:  5 * time.Second,
-			ReadTimeout:  3 * time.Second,
-			WriteTimeout: 3 * time.Second,
-			PoolSize:     100,
-			MinIdleConns: 10,
-		})
+		redisClient := newRedisClient(redisAddr, redisPassword, redisDB)
 
 		// Test Redis connection
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

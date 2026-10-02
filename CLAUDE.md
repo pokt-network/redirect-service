@@ -99,7 +99,7 @@ All application logic lives in `main.go`. This is intentional for simplicity and
 - Per-IP, per-subdomain tracking across all Taiji instances
 - Lua script ensures atomicity across pods (no race between count check and add)
 - Blocked requests do NOT consume rate limit budget
-- Fails open if Redis unavailable (allows requests)
+- Fails open if Redis unavailable (allows requests): each check gives up after 250ms, and after 3 consecutive failures Redis is skipped for 5s
 - Returns standard `X-RateLimit-*` headers and `Retry-After` on 429s
 - Format: `100/1m`, `1000/1h`, `10/30s`
 

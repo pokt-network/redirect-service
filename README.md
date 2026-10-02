@@ -139,7 +139,7 @@ Distributed IP-based rate limiting using Redis with sliding window algorithm:
 - Sliding window algorithm prevents boundary exploits
 - Extracts the real client IP from `X-Forwarded-For`, walked from the right past trusted proxies (`TRUSTED_PROXY_CIDRS`, or private/loopback addresses when unset). `Forwarded`, `CF-Connecting-IP`, `True-Client-IP` and `X-Real-IP` are not trusted: a client can set them.
 - Returns standard `X-RateLimit-*` headers and `Retry-After` on 429s
-- Fails open if Redis unavailable (allows requests)
+- Fails open if Redis unavailable (allows requests): each check gives up after 250ms, and after 3 consecutive failures Redis is skipped for 5s
 
 **Rate limit format:** `{requests}/{duration}` - e.g., `100/1m`, `1000/1h`, `10/30s`
 
