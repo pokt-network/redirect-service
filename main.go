@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net"
@@ -253,6 +255,9 @@ type RateLimitConfig struct {
 	Requests int           // Number of requests allowed
 	Window   time.Duration // Time window for rate limit
 	Message  string        // Custom rate limit exceeded message
+	// CountBatchItems charges a JSON-RPC batch one unit per item instead of
+	// one per HTTP request. Per-IP limits only; see batchWeight.
+	CountBatchItems bool
 }
 
 // YAMLConfig YAML Configuration Structs
@@ -262,14 +267,17 @@ type YAMLConfig struct {
 }
 
 type ServiceConfig struct {
-	Name             string             `yaml:"name"`
-	RateLimit        string             `yaml:"rate_limit"`
-	RateLimitGlobal  string             `yaml:"rate_limit_global,omitempty"`
-	RateLimitMessage string             `yaml:"rate_limit_message,omitempty"`
-	RetryPolicy      string             `yaml:"retry_policy,omitempty"` // "fail-fast" (default) or "retry-all" — server-side override
-	HealthCheck      *HealthCheckConfig `yaml:"health_check,omitempty"`
-	Backends         []BackendConfig    `yaml:"backends"`
-	Fallbacks        []BackendConfig    `yaml:"fallbacks,omitempty"`
+	Name             string `yaml:"name"`
+	RateLimit        string `yaml:"rate_limit"`
+	RateLimitGlobal  string `yaml:"rate_limit_global,omitempty"`
+	RateLimitMessage string `yaml:"rate_limit_message,omitempty"`
+	// RateLimitCountBatchItems makes the per-IP rate_limit count each item of a
+	// JSON-RPC batch, so a 100-item batch costs 100 instead of 1. Off by default.
+	RateLimitCountBatchItems bool               `yaml:"rate_limit_count_batch_items,omitempty"`
+	RetryPolicy              string             `yaml:"retry_policy,omitempty"` // "fail-fast" (default) or "retry-all" — server-side override
+	HealthCheck              *HealthCheckConfig `yaml:"health_check,omitempty"`
+	Backends                 []BackendConfig    `yaml:"backends"`
+	Fallbacks                []BackendConfig    `yaml:"fallbacks,omitempty"`
 }
 
 type BackendConfig struct {
@@ -385,6 +393,7 @@ local now = tonumber(ARGV[1])
 local window_start = tonumber(ARGV[2])
 local limit = tonumber(ARGV[3])
 local ttl = tonumber(ARGV[4])
+local weight = tonumber(ARGV[5]) or 1
 
 -- Clean up old entries
 redis.call('ZREMRANGEBYSCORE', key, '0', window_start)
@@ -392,19 +401,27 @@ redis.call('ZREMRANGEBYSCORE', key, '0', window_start)
 -- Count current requests in window
 local count = redis.call('ZCARD', key)
 
--- At or over the limit: reject without consuming budget. Refresh the TTL anyway
--- so a saturated key still expires once traffic stops.
-if count >= limit then
+-- Not enough room for the whole weight: reject without consuming budget. Refresh
+-- the TTL anyway so a saturated key still expires once traffic stops.
+-- With weight 1 this is the original "count >= limit" test.
+if count + weight > limit then
     redis.call('EXPIRE', key, ttl)
     return -1
 end
 
-redis.call('ZADD', key, now, now)
+-- One member per unit; members must be unique within the sorted set.
+if weight == 1 then
+    redis.call('ZADD', key, now, now)
+else
+    for i = 1, weight do
+        redis.call('ZADD', key, now, now .. ':' .. i)
+    end
+end
 
 -- Set TTL for memory cleanup
 redis.call('EXPIRE', key, ttl)
 
-return count + 1
+return count + weight
 `)
 
 // CheckLimit checks if the request is within rate limit using sliding window algorithm.
@@ -412,6 +429,16 @@ return count + 1
 // Blocked requests do not consume rate limit budget.
 // Returns: allowed (bool), remaining (int), resetAt (time.Time), error
 func (rl *RateLimiter) CheckLimit(ctx context.Context, ip, subdomain string, limit int, window time.Duration) (bool, int, time.Time, error) {
+	return rl.CheckLimitN(ctx, ip, subdomain, limit, window, 1)
+}
+
+// CheckLimitN is CheckLimit charging `weight` units at once (a JSON-RPC batch
+// of N items). The request is allowed only if the whole weight fits, so a batch
+// larger than the limit itself is always rejected.
+func (rl *RateLimiter) CheckLimitN(ctx context.Context, ip, subdomain string, limit int, window time.Duration, weight int) (bool, int, time.Time, error) {
+	if weight < 1 {
+		weight = 1
+	}
 	if rl == nil || rl.redis == nil {
 		// Rate limiting disabled or Redis not available - allow request
 		return true, limit, time.Now().Add(window), nil
@@ -440,6 +467,7 @@ func (rl *RateLimiter) CheckLimit(ctx context.Context, ip, subdomain string, lim
 		windowStart.UnixNano(),  // ARGV[2]: window start
 		limit,                   // ARGV[3]: max requests
 		int(window.Seconds())+1, // ARGV[4]: TTL in seconds (window + 1s buffer)
+		weight,                  // ARGV[5]: units this request costs
 	).Int64()
 
 	if err != nil {
@@ -706,6 +734,42 @@ func isStreamingRequest(r *http.Request) bool {
 	return strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc")
 }
 
+// maxBatchPeekBytes bounds how much of a request body batchWeight buffers to
+// count batch items. Items past it are not counted (the batch is under-charged,
+// never rejected for size here).
+const maxBatchPeekBytes = 4 << 20
+
+// batchWeight returns the number of items in a JSON-RPC batch body (a top-level
+// JSON array), or 1 for anything else. It reads at most maxBatchPeekBytes and
+// puts every byte it read back in front of the unread rest, so the backend
+// receives the body unchanged.
+func batchWeight(r *http.Request) int {
+	if r.Body == nil || r.Body == http.NoBody {
+		return 1
+	}
+	var buf bytes.Buffer
+	dec := json.NewDecoder(io.TeeReader(io.LimitReader(r.Body, maxBatchPeekBytes), &buf))
+	n := 1
+	if tok, err := dec.Token(); err == nil && tok == json.Delim('[') {
+		n = 0
+		var item json.RawMessage
+		for dec.More() {
+			if dec.Decode(&item) != nil {
+				break
+			}
+			n++
+		}
+		if n == 0 {
+			n = 1
+		}
+	}
+	r.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(&buf, r.Body), r.Body}
+	return n
+}
+
 // boolToString converts a boolean to "true" or "false" string for metric labels
 func boolToString(b bool) string {
 	if b {
@@ -894,6 +958,7 @@ func (s *ProxyService) LoadRules() error {
 				if svc.RateLimitMessage != "" {
 					rateLimit.Message = strings.TrimSpace(svc.RateLimitMessage)
 				}
+				rateLimit.CountBatchItems = svc.RateLimitCountBatchItems
 			}
 		}
 
@@ -1489,12 +1554,17 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if rateLimitConfig != nil {
-			allowed, remaining, resetAt, err := s.rateLimiter.CheckLimit(
+			weight := 1
+			if rateLimitConfig.CountBatchItems && r.Method == http.MethodPost && !isStreamingRequest(r) {
+				weight = batchWeight(r)
+			}
+			allowed, remaining, resetAt, err := s.rateLimiter.CheckLimitN(
 				r.Context(),
 				clientIP,
 				subdomain,
 				rateLimitConfig.Requests,
 				rateLimitConfig.Window,
+				weight,
 			)
 
 			if err != nil {

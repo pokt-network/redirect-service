@@ -3,7 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -252,5 +256,69 @@ func TestRateLimiterUnreachableRedisFailsFast(t *testing.T) {
 	}
 	if took := time.Since(start); took > 10*time.Millisecond {
 		t.Fatalf("check after %d failures took %s, want Redis skipped", redisFailuresToSkip, took)
+	}
+}
+
+// TestRateLimiterWeightedBatch pins CheckLimitN: a request charges its whole
+// weight, is rejected when the weight does not fit, and a rejected batch costs
+// nothing.
+func TestRateLimiterWeightedBatch(t *testing.T) {
+	rl := newTestRateLimiter(t)
+	ctx := context.Background()
+	const limit = 10
+	window := time.Minute
+
+	allowed, remaining, _, err := rl.CheckLimitN(ctx, "1.2.3.4", "eth", limit, window, 7)
+	if err != nil || !allowed || remaining != 3 {
+		t.Fatalf("batch of 7: allowed=%v remaining=%d err=%v, want true 3 nil", allowed, remaining, err)
+	}
+	// 4 more do not fit in the 3 left: rejected, and no budget consumed.
+	if allowed, _, _, _ := rl.CheckLimitN(ctx, "1.2.3.4", "eth", limit, window, 4); allowed {
+		t.Fatal("batch of 4 with 3 left was allowed")
+	}
+	if card := rl.redis.ZCard(ctx, "ratelimit:eth:1.2.3.4").Val(); card != 7 {
+		t.Fatalf("window holds %d entries after a rejected batch, want 7", card)
+	}
+	// A single request still fits.
+	if allowed, remaining, _, _ := rl.CheckLimit(ctx, "1.2.3.4", "eth", limit, window); !allowed || remaining != 2 {
+		t.Fatalf("single request: allowed=%v remaining=%d, want true 2", allowed, remaining)
+	}
+	// A batch larger than the limit itself never fits.
+	if allowed, _, _, _ := rl.CheckLimitN(ctx, "5.6.7.8", "eth", limit, window, limit+1); allowed {
+		t.Fatal("batch larger than the limit was allowed")
+	}
+}
+
+// TestBatchWeight counts top-level array items and leaves the body intact.
+func TestBatchWeight(t *testing.T) {
+	cases := []struct {
+		body string
+		want int
+	}{
+		{`{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}`, 1},
+		{`[{"id":1},{"id":2},{"id":3}]`, 3},
+		{` [ {"id":1, "params":["a",[1,2]]} , {"id":2} ] `, 2},
+		{`[]`, 1},
+		{`not json`, 1},
+		{`[{"id":1},{"id":`, 1}, // truncated: counts what parsed
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(c.body))
+		if got := batchWeight(r); got != c.want {
+			t.Errorf("batchWeight(%q) = %d, want %d", c.body, got, c.want)
+		}
+		rest, _ := io.ReadAll(r.Body)
+		if string(rest) != c.body {
+			t.Errorf("body changed: got %q, want %q", rest, c.body)
+		}
+	}
+	// Bodies past the peek limit stay intact too.
+	big := "[" + strings.Repeat(`{"id":1},`, maxBatchPeekBytes/9+10) + `{"id":2}]`
+	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(big))
+	if got := batchWeight(r); got < 1 {
+		t.Fatalf("big batch weight %d", got)
+	}
+	if rest, _ := io.ReadAll(r.Body); string(rest) != big {
+		t.Fatal("big body changed")
 	}
 }

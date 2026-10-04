@@ -85,6 +85,10 @@ services:
   - name: rate_dual
     rate_limit: "100/1m"         # Per-IP: 100 requests/min per IP
     rate_limit_global: "10000/1m" # Global: 10,000 requests/min across ALL IPs
+    # Charge each item of a JSON-RPC batch against the per-IP limit, so a
+    # 100-item batch costs 100 (default false: one per HTTP request). The
+    # global limit stays per request.
+    rate_limit_count_batch_items: true
     backends:
       - url: "http://localhost:4040"
         strip_path: false
