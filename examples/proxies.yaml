@@ -87,7 +87,9 @@ services:
     rate_limit_global: "10000/1m" # Global: 10,000 requests/min across ALL IPs
     # Charge each item of a JSON-RPC batch against the per-IP limit, so a
     # 100-item batch costs 100 (default false: one per HTTP request). The
-    # global limit stays per request.
+    # global limit stays per request. Needs rate_limit on this service. A batch
+    # with more items than the limit, over 1MB, or not a valid JSON array gets
+    # 413.
     rate_limit_count_batch_items: true
     backends:
       - url: "http://localhost:4040"

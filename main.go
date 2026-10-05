@@ -378,15 +378,16 @@ func newRedisClient(addr, password string, db int) *redis.Client {
 // It checks the count BEFORE adding the request, so blocked requests don't consume budget.
 // Running as a Lua script ensures atomicity across multiple Taiji pods sharing the same Redis.
 //
-// Return contract: the number of requests in the window INCLUDING this one when
-// the request is allowed (1..limit), or -1 when the window is full.
+// Return contract: {allowed, used}. allowed is 1 or 0; used is the number of
+// units in the window after this call (including this request's weight when
+// allowed), so the caller can report what is left either way.
 //
-// The -1 sentinel is load-bearing. An earlier version returned the count clamped
-// at `limit` — because a full window skips the ZADD, `count` could never exceed
-// `limit`, so the caller's `count <= limit` test was true even at capacity and
-// the limiter never blocked a single request in production. "At capacity" and
-// "exactly full but allowed" are indistinguishable from a count alone; they have
-// to be different return values.
+// The separate allowed flag is load-bearing. An earlier version returned only the
+// count clamped at `limit` — because a full window skips the ZADD, `count` could
+// never exceed `limit`, so the caller's `count <= limit` test was true even at
+// capacity and the limiter never blocked a single request in production. "At
+// capacity" and "exactly full but allowed" are indistinguishable from a count
+// alone; they have to be different return values.
 var rateLimitScript = redis.NewScript(`
 local key = KEYS[1]
 local now = tonumber(ARGV[1])
@@ -406,22 +407,21 @@ local count = redis.call('ZCARD', key)
 -- With weight 1 this is the original "count >= limit" test.
 if count + weight > limit then
     redis.call('EXPIRE', key, ttl)
-    return -1
+    return {0, count}
 end
 
--- One member per unit; members must be unique within the sorted set.
-if weight == 1 then
-    redis.call('ZADD', key, now, now)
-else
-    for i = 1, weight do
-        redis.call('ZADD', key, now, now .. ':' .. i)
-    end
+-- One member per unit; members must be unique within the sorted set. Build them
+-- from the ARGV[1] string, not the number: Lua prints a nanosecond timestamp
+-- with 14 significant digits, so batches ~100µs apart would share members and
+-- overwrite each other instead of adding up.
+for i = 1, weight do
+    redis.call('ZADD', key, now, ARGV[1] .. ':' .. i)
 end
 
 -- Set TTL for memory cleanup
 redis.call('EXPIRE', key, ttl)
 
-return count + weight
+return {1, count + weight}
 `)
 
 // CheckLimit checks if the request is within rate limit using sliding window algorithm.
@@ -462,13 +462,13 @@ func (rl *RateLimiter) CheckLimitN(ctx context.Context, ip, subdomain string, li
 	windowStart := now.Add(-window)
 
 	// Execute atomic Lua script
-	count, err := rateLimitScript.Run(ctx, rl.redis, []string{key},
+	res, err := rateLimitScript.Run(ctx, rl.redis, []string{key},
 		now.UnixNano(),          // ARGV[1]: current timestamp
 		windowStart.UnixNano(),  // ARGV[2]: window start
 		limit,                   // ARGV[3]: max requests
 		int(window.Seconds())+1, // ARGV[4]: TTL in seconds (window + 1s buffer)
 		weight,                  // ARGV[5]: units this request costs
-	).Int64()
+	).Int64Slice()
 
 	if err != nil {
 		if rl.failures.Add(1) >= redisFailuresToSkip &&
@@ -479,20 +479,10 @@ func (rl *RateLimiter) CheckLimitN(ctx context.Context, ip, subdomain string, li
 	}
 	rl.failures.Store(0)
 
-	resetAt := now.Add(window)
-
-	// Negative count is the script's explicit "window full" sentinel. Do not
-	// re-derive this from the count: see the rateLimitScript comment.
-	if count < 0 {
-		return false, 0, resetAt, nil
-	}
-
-	remaining := limit - int(count)
-	if remaining < 0 {
-		remaining = 0
-	}
-
-	return true, remaining, resetAt, nil
+	// Take allowed from the script's flag. Do not re-derive it from the count:
+	// see the rateLimitScript comment.
+	allowed, used := res[0] == 1, res[1]
+	return allowed, max(limit-int(used), 0), now.Add(window), nil
 }
 
 type proxyMetadata struct {
@@ -735,39 +725,58 @@ func isStreamingRequest(r *http.Request) bool {
 }
 
 // maxBatchPeekBytes bounds how much of a request body batchWeight buffers to
-// count batch items. Items past it are not counted (the batch is under-charged,
-// never rejected for size here).
-const maxBatchPeekBytes = 4 << 20
+// count batch items. A batch that does not close within it cannot be counted
+// and is rejected.
+const maxBatchPeekBytes = 1 << 20
+
+// batchPeekTimeout bounds how long batchWeight waits for the body. The server
+// has no ReadTimeout (streaming), so without it a slow body would hold the
+// handler before the rate limit gets to reject the request. A var for tests.
+var batchPeekTimeout = 30 * time.Second
 
 // batchWeight returns the number of items in a JSON-RPC batch body (a top-level
-// JSON array), or 1 for anything else. It reads at most maxBatchPeekBytes and
-// puts every byte it read back in front of the unread rest, so the backend
-// receives the body unchanged.
-func batchWeight(r *http.Request) int {
+// JSON array), or 1 for anything else. ok is false when the body is an array
+// that does not parse through its closing bracket within maxBatchPeekBytes
+// (malformed, too large, or the read failed): charging only the items before
+// the cut would let padding hide the rest. It puts every byte it read back in
+// front of the unread rest, so the backend receives the body unchanged.
+func batchWeight(r *http.Request) (n int, ok bool) {
 	if r.Body == nil || r.Body == http.NoBody {
-		return 1
+		return 1, true
 	}
+	body := r.Body
 	var buf bytes.Buffer
-	dec := json.NewDecoder(io.TeeReader(io.LimitReader(r.Body, maxBatchPeekBytes), &buf))
-	n := 1
-	if tok, err := dec.Token(); err == nil && tok == json.Delim('[') {
-		n = 0
-		var item json.RawMessage
-		for dec.More() {
-			if dec.Decode(&item) != nil {
-				break
-			}
-			n++
-		}
-		if n == 0 {
-			n = 1
-		}
+	defer func() {
+		r.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.MultiReader(&buf, body), body}
+	}()
+	dec := json.NewDecoder(io.TeeReader(io.LimitReader(body, maxBatchPeekBytes), &buf))
+
+	tok, err := dec.Token()
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &syntaxErr) || (err == io.EOF && buf.Len() < maxBatchPeekBytes) {
+		return 1, true // not JSON, or empty: not a batch
 	}
-	r.Body = struct {
-		io.Reader
-		io.Closer
-	}{io.MultiReader(&buf, r.Body), r.Body}
-	return n
+	if err != nil {
+		return 0, false // read failed, or whitespace past the bound hides what follows
+	}
+	if tok != json.Delim('[') {
+		return 1, true
+	}
+
+	var item json.RawMessage
+	for dec.More() {
+		if dec.Decode(&item) != nil {
+			return 0, false
+		}
+		n++
+	}
+	if tok, err := dec.Token(); err != nil || tok != json.Delim(']') {
+		return 0, false
+	}
+	return max(n, 1), true
 }
 
 // boolToString converts a boolean to "true" or "false" string for metric labels
@@ -960,6 +969,9 @@ func (s *ProxyService) LoadRules() error {
 				}
 				rateLimit.CountBatchItems = svc.RateLimitCountBatchItems
 			}
+		}
+		if svc.RateLimitCountBatchItems && rateLimit == nil {
+			log.Printf("WARN: rate_limit_count_batch_items for service '%s' needs a valid rate_limit, ignoring", subdomain)
 		}
 
 		// Parse global rate limit (all IPs combined)
@@ -1556,7 +1568,20 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		if rateLimitConfig != nil {
 			weight := 1
 			if rateLimitConfig.CountBatchItems && r.Method == http.MethodPost && !isStreamingRequest(r) {
-				weight = batchWeight(r)
+				// ErrNotSupported (no deadline support) leaves the read unbounded, as before.
+				rc := http.NewResponseController(w)
+				_ = rc.SetReadDeadline(time.Now().Add(batchPeekTimeout))
+				n, ok := batchWeight(r)
+				// Back to no deadline: Server.ReadTimeout is 0, so there is none to restore.
+				_ = rc.SetReadDeadline(time.Time{})
+				// A batch that cannot be counted, or that exceeds the whole limit,
+				// never fits: say so instead of a 429 the client would retry forever.
+				if !ok || n > rateLimitConfig.Requests {
+					http.Error(w, "Payload Too Large: a JSON-RPC batch must be a valid JSON array of at most "+
+						strconv.Itoa(rateLimitConfig.Requests)+" items and "+strconv.Itoa(maxBatchPeekBytes>>20)+"MB", http.StatusRequestEntityTooLarge)
+					return
+				}
+				weight = n
 			}
 			allowed, remaining, resetAt, err := s.rateLimiter.CheckLimitN(
 				r.Context(),

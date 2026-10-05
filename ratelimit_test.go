@@ -272,9 +272,10 @@ func TestRateLimiterWeightedBatch(t *testing.T) {
 	if err != nil || !allowed || remaining != 3 {
 		t.Fatalf("batch of 7: allowed=%v remaining=%d err=%v, want true 3 nil", allowed, remaining, err)
 	}
-	// 4 more do not fit in the 3 left: rejected, and no budget consumed.
-	if allowed, _, _, _ := rl.CheckLimitN(ctx, "1.2.3.4", "eth", limit, window, 4); allowed {
-		t.Fatal("batch of 4 with 3 left was allowed")
+	// 4 more do not fit in the 3 left: rejected, no budget consumed, and the
+	// 3 still left are reported.
+	if allowed, remaining, _, _ := rl.CheckLimitN(ctx, "1.2.3.4", "eth", limit, window, 4); allowed || remaining != 3 {
+		t.Fatalf("batch of 4 with 3 left: allowed=%v remaining=%d, want false 3", allowed, remaining)
 	}
 	if card := rl.redis.ZCard(ctx, "ratelimit:eth:1.2.3.4").Val(); card != 7 {
 		t.Fatalf("window holds %d entries after a rejected batch, want 7", card)
@@ -289,36 +290,143 @@ func TestRateLimiterWeightedBatch(t *testing.T) {
 	}
 }
 
-// TestBatchWeight counts top-level array items and leaves the body intact.
+// TestRateLimitScriptExactMembers pins the members the script writes to the
+// exact ARGV[1] string. Built from the Lua number instead, real Redis prints 14
+// significant digits, so batches ~100µs apart wrote the same members and a
+// burst of 50 five-item batches got 14 through a 10/min limit. miniredis keeps
+// more digits than Redis, so only an unrepresentable timestamp shows it here.
+func TestRateLimitScriptExactMembers(t *testing.T) {
+	rl := newTestRateLimiter(t)
+	ctx := context.Background()
+	const now = "1759600000123456789" // not representable in float64
+	if err := rateLimitScript.Run(ctx, rl.redis, []string{"k"}, now, 0, 10, 60, 2).Err(); err != nil {
+		t.Fatal(err)
+	}
+	got := rl.redis.ZRange(ctx, "k", 0, -1).Val()
+	if len(got) != 2 || got[0] != now+":1" || got[1] != now+":2" {
+		t.Fatalf("members %v, want [%s:1 %s:2]", got, now, now)
+	}
+}
+
+// TestBatchWeight counts top-level array items, refuses arrays it cannot count
+// to the end, and leaves the body intact either way.
 func TestBatchWeight(t *testing.T) {
+	pad := strings.Repeat(" ", maxBatchPeekBytes)
+	items := strings.Repeat(`{"id":1},`, 999) + `{"id":1}`
 	cases := []struct {
-		body string
-		want int
+		name   string
+		body   string
+		want   int
+		wantOK bool
 	}{
-		{`{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}`, 1},
-		{`[{"id":1},{"id":2},{"id":3}]`, 3},
-		{` [ {"id":1, "params":["a",[1,2]]} , {"id":2} ] `, 2},
-		{`[]`, 1},
-		{`not json`, 1},
-		{`[{"id":1},{"id":`, 1}, // truncated: counts what parsed
+		{"single call", `{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}`, 1, true},
+		{"batch", `[{"id":1},{"id":2},{"id":3}]`, 3, true},
+		{"nested and spaced", ` [ {"id":1, "params":["a",[1,2]]} , {"id":2} ] `, 2, true},
+		{"empty batch", `[]`, 1, true},
+		{"not json", `not json`, 1, true},
+		{"whitespace only", `   `, 1, true},
+		{"truncated", `[{"id":1},{"id":`, 0, false},
+		{"missing comma", `[{"id":1} {"id":2}]`, 0, false},
+		{"padding inside the array", "[" + pad + items + "]", 0, false},
+		{"padding before the array", pad + "[" + items + "]", 0, false},
+		{"array past the bound", "[" + strings.Repeat(`{"id":1},`, maxBatchPeekBytes/9) + `{"id":2}]`, 0, false},
 	}
 	for _, c := range cases {
 		r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(c.body))
-		if got := batchWeight(r); got != c.want {
-			t.Errorf("batchWeight(%q) = %d, want %d", c.body, got, c.want)
+		if got, ok := batchWeight(r); got != c.want || ok != c.wantOK {
+			t.Errorf("%s: batchWeight = %d, %v, want %d, %v", c.name, got, ok, c.want, c.wantOK)
 		}
-		rest, _ := io.ReadAll(r.Body)
-		if string(rest) != c.body {
-			t.Errorf("body changed: got %q, want %q", rest, c.body)
+		if rest, _ := io.ReadAll(r.Body); string(rest) != c.body {
+			t.Errorf("%s: body changed", c.name)
 		}
 	}
-	// Bodies past the peek limit stay intact too.
-	big := "[" + strings.Repeat(`{"id":1},`, maxBatchPeekBytes/9+10) + `{"id":2}]`
-	r := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(big))
-	if got := batchWeight(r); got < 1 {
-		t.Fatalf("big batch weight %d", got)
+}
+
+// TestBatchRateLimitThroughProxy drives batch counting through the handler: a
+// batch charges its items, reaches the backend unchanged, and a batch that can
+// never fit, or cannot be counted, gets 413 rather than a retryable 429.
+func TestBatchRateLimitThroughProxy(t *testing.T) {
+	var gotBody string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+	}))
+	t.Cleanup(backend.Close)
+
+	limit := &RateLimitConfig{Requests: 5, Window: time.Minute, CountBatchItems: true}
+	svc := NewProxyService("examples/proxies.yaml", newTestRateLimiter(t), true, limit, false)
+	injectRules(svc, map[string][]ProxyRule{"test": {{ProxyTo: backend.URL, Weight: 1}}})
+
+	steps := []struct {
+		body          string
+		wantStatus    int
+		wantRemaining string
+	}{
+		{`[{"id":1},{"id":2},{"id":3}]`, http.StatusOK, "2"},
+		{`[{"id":1},{"id":2},{"id":3},{"id":4},{"id":5},{"id":6}]`, http.StatusRequestEntityTooLarge, ""},
+		{"[" + strings.Repeat(" ", maxBatchPeekBytes) + `{"id":1}]`, http.StatusRequestEntityTooLarge, ""},
+		{`[{"id":1},{"id":2},{"id":3}]`, http.StatusTooManyRequests, "2"},
+		{`{"id":1}`, http.StatusOK, "1"},
 	}
-	if rest, _ := io.ReadAll(r.Body); string(rest) != big {
-		t.Fatal("big body changed")
+	for i, st := range steps {
+		gotBody = ""
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(st.body))
+		req.Host = "test.api.pocket.network"
+		rec := httptest.NewRecorder()
+		svc.Router().ServeHTTP(rec, req)
+		if rec.Code != st.wantStatus || rec.Header().Get("X-RateLimit-Remaining") != st.wantRemaining {
+			t.Fatalf("step %d: status %d remaining %q, want %d %q", i, rec.Code, rec.Header().Get("X-RateLimit-Remaining"), st.wantStatus, st.wantRemaining)
+		}
+		if st.wantStatus == http.StatusOK && gotBody != st.body {
+			t.Fatalf("step %d: backend got %q, want %q", i, gotBody, st.body)
+		}
+	}
+}
+
+// TestBatchRateLimitRealServer runs the peek on a real connection: the body
+// reaches the backend byte-identical, and a body that stalls inside a batch hits
+// the read deadline and gets 413 instead of holding the handler.
+func TestBatchRateLimitRealServer(t *testing.T) {
+	defer func(d time.Duration) { batchPeekTimeout = d }(batchPeekTimeout)
+	batchPeekTimeout = 100 * time.Millisecond // set before any server goroutine reads it
+
+	var gotBody string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+	}))
+	defer backend.Close()
+	limit := &RateLimitConfig{Requests: 5, Window: time.Minute, CountBatchItems: true}
+	svc := NewProxyService("examples/proxies.yaml", newTestRateLimiter(t), true, limit, false)
+	injectRules(svc, map[string][]ProxyRule{"test": {{ProxyTo: backend.URL, Weight: 1}}})
+	proxy := httptest.NewServer(svc.Router())
+	defer proxy.Close()
+
+	post := func(body io.Reader) *http.Response {
+		req, _ := http.NewRequest(http.MethodPost, proxy.URL, body)
+		req.Host = "test.api.pocket.network"
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp
+	}
+
+	const batch = `[{"id":1},{"id":2},{"id":3}]`
+	if resp := post(strings.NewReader(batch)); resp.StatusCode != http.StatusOK ||
+		resp.Header.Get("X-RateLimit-Remaining") != "2" || gotBody != batch {
+		t.Fatalf("batch: status %d remaining %q backend got %q", resp.StatusCode, resp.Header.Get("X-RateLimit-Remaining"), gotBody)
+	}
+
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	go func() { _, _ = pw.Write([]byte(`[{"id":1},`)) }() // then stalls
+	start := time.Now()
+	if resp := post(pr); resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("stalled batch: status %d, want 413", resp.StatusCode)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("stalled batch held the handler for %s", took)
 	}
 }
