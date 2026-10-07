@@ -259,6 +259,47 @@ func TestRateLimiterUnreachableRedisFailsFast(t *testing.T) {
 	}
 }
 
+// TestRateLimiterBurstDoesNotTripSkip pins the 2026-10-07 mainnet finding: on
+// pods off Redis's node, a short network stall failed many in-flight checks at
+// once, tripped the Redis skip 2-4 times per 30m, and each trip turned rate
+// limiting off for redisBackoff (~1% of requests failed open). A burst of
+// failures right after a success must keep checking Redis; the same failures
+// with no success for redisTripAfter must still skip it.
+func TestRateLimiterBurstDoesNotTripSkip(t *testing.T) {
+	srv := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: srv.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+	rl := &RateLimiter{redis: client}
+	ctx := context.Background()
+	check := func() error {
+		_, _, _, err := rl.CheckLimit(ctx, "1.2.3.4", "eth", 100, time.Minute)
+		return err
+	}
+
+	if err := check(); err != nil {
+		t.Fatal(err)
+	}
+	srv.SetError("stall")
+	for i := 1; i <= 2*redisFailuresToSkip; i++ {
+		if err := check(); err == nil || errors.Is(err, errRedisUnavailable) {
+			t.Fatalf("burst failure %d: err=%v, want a Redis error", i, err)
+		}
+	}
+	srv.SetError("")
+	if err := check(); err != nil {
+		t.Fatalf("after the burst: err=%v, want Redis checked again", err)
+	}
+
+	srv.SetError("down")
+	rl.lastOK.Store(time.Now().Add(-redisTripAfter).UnixNano())
+	for i := 0; i < redisFailuresToSkip; i++ {
+		_ = check()
+	}
+	if err := check(); !errors.Is(err, errRedisUnavailable) {
+		t.Fatalf("sustained failure: err=%v, want errRedisUnavailable", err)
+	}
+}
+
 // TestRateLimiterWeightedBatch pins CheckLimitN: a request charges its whole
 // weight, is rejected when the weight does not fit, and a rejected batch costs
 // nothing.

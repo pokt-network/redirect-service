@@ -338,11 +338,14 @@ type ProxyService struct {
 type RateLimiter struct {
 	redis *redis.Client
 	// downUntil (unix nanos) skips Redis after redisFailuresToSkip consecutive
-	// failures, so an unreachable Redis costs one bounded timeout per
-	// redisBackoff instead of one per request. A single slow check (~1/s per
-	// pod exceed 100ms in normal traffic) must not switch rate limiting off.
+	// failures with no success for redisTripAfter, so an unreachable Redis
+	// costs one bounded timeout per redisBackoff instead of one per request.
+	// Neither a single slow check (~1/s per pod exceed 100ms in normal
+	// traffic) nor a burst of in-flight checks failing together on a short
+	// network stall may switch rate limiting off.
 	downUntil atomic.Int64
 	failures  atomic.Int32
+	lastOK    atomic.Int64 // unix nanos when the last successful check started
 }
 
 const (
@@ -353,6 +356,12 @@ const (
 	redisCheckTimeout   = 250 * time.Millisecond
 	redisBackoff        = 5 * time.Second
 	redisFailuresToSkip = 3
+	// redisTripAfter is how long Redis must have gone without a successful
+	// check before failures skip it. On 2026-10-07, pods off Redis's node had
+	// up to 28 in-flight checks time out within one second on cross-node
+	// stalls; without this gate that tripped the skip 2-4 times per 30m per
+	// pod and failed open ~1% of their requests.
+	redisTripAfter = time.Second
 )
 
 // errRedisUnavailable is returned while Redis is being skipped after a failure.
@@ -472,12 +481,14 @@ func (rl *RateLimiter) CheckLimitN(ctx context.Context, ip, subdomain string, li
 
 	if err != nil {
 		if rl.failures.Add(1) >= redisFailuresToSkip &&
+			time.Now().UnixNano()-rl.lastOK.Load() >= int64(redisTripAfter) &&
 			rl.downUntil.Swap(time.Now().Add(redisBackoff).UnixNano()) < now.UnixNano() {
 			log.Printf("ERROR: Redis rate limit checks failing, skipping rate limiting for %s: %v", redisBackoff, err)
 		}
 		return false, 0, time.Time{}, fmt.Errorf("redis rate limit script error: %w", err)
 	}
 	rl.failures.Store(0)
+	rl.lastOK.Store(now.UnixNano())
 
 	// Take allowed from the script's flag. Do not re-derive it from the count:
 	// see the rateLimitScript comment.
