@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -520,5 +522,79 @@ func TestGlobalBatchCountingIsSeparate(t *testing.T) {
 		if code := post(svc, st.ip, st.body); code != st.want {
 			t.Fatalf("global counting, step %d: status %d, want %d", i, code, st.want)
 		}
+	}
+}
+
+// counterValue reads a Prometheus counter's current value.
+func counterValue(c prometheus.Counter) float64 {
+	var m dto.Metric
+	_ = c.Write(&m)
+	return m.GetCounter().GetValue()
+}
+
+// TestClientGoneIsNotARedisFailure pins the 1.7.0 mainnet finding: with batch
+// counting on, reading the body lets the server notice a closed client before
+// the rate-limit check, and the cancelled check was counted and logged as a
+// Redis failure (0.2-1.2% "fail-open" per pod, thousands of ERROR lines). A
+// request whose client is gone gets 499, is not proxied, and touches neither
+// the Redis error metric nor the skip.
+func TestClientGoneIsNotARedisFailure(t *testing.T) {
+	reached := false
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { reached = true }))
+	t.Cleanup(backend.Close)
+	rl := newTestRateLimiter(t)
+	svc := NewProxyService("examples/proxies.yaml", rl, true, &RateLimitConfig{Requests: 100, Window: time.Minute}, false)
+	injectRules(svc, map[string][]ProxyRule{"test": {{ProxyTo: backend.URL, Weight: 1,
+		GlobalLimit: &RateLimitConfig{Requests: 1000, Window: time.Minute}}}})
+
+	redisErrors := counterValue(proxyRateLimitRedisErrorsTotal)
+	closed := proxyRequestsTotal.WithLabelValues("test", normalizeBackendLabel("unknown"), "499", "rpc", "false")
+	before := counterValue(closed)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"id":1}`)).WithContext(ctx)
+	req.Host = "test.api.pocket.network"
+	svc.Router().ServeHTTP(httptest.NewRecorder(), req)
+
+	if reached {
+		t.Error("request from a gone client was proxied")
+	}
+	if got := counterValue(proxyRateLimitRedisErrorsTotal) - redisErrors; got != 0 {
+		t.Errorf("redis errors metric rose by %v, want 0", got)
+	}
+	if got := counterValue(closed) - before; got != 1 {
+		t.Errorf("499 requests rose by %v, want 1", got)
+	}
+	if f := rl.failures.Load(); f != 0 {
+		t.Errorf("skip failure count %d, want 0", f)
+	}
+}
+
+// TestClientGoneDuringBackendCallRecords499 pins the metrics wrapper keeping
+// the 499 the proxy's ErrorHandler sets: it used to overwrite it with the
+// wrapper's default 200, counting abandoned requests as successes.
+func TestClientGoneDuringBackendCallRecords499(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body) // lets the server notice the proxy hanging up
+		cancel()                  // the client leaves while the backend is working
+		select {
+		case <-r.Context().Done():
+		case <-time.After(2 * time.Second):
+		}
+	}))
+	t.Cleanup(backend.Close)
+	svc := NewProxyService("examples/proxies.yaml", nil, false, nil, false)
+	injectRules(svc, map[string][]ProxyRule{"test": {{ProxyTo: backend.URL, Weight: 1}}})
+
+	closed := proxyRequestsTotal.WithLabelValues("test", normalizeBackendLabel(strings.TrimPrefix(backend.URL, "http://")), "499", "rpc", "false")
+	before := counterValue(closed)
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"id":1}`)).WithContext(ctx)
+	req.Host = "test.api.pocket.network"
+	svc.Router().ServeHTTP(httptest.NewRecorder(), req)
+
+	if got := counterValue(closed) - before; got != 1 {
+		t.Errorf("499 requests rose by %v, want 1", got)
 	}
 }

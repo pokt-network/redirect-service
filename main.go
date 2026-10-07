@@ -72,6 +72,10 @@ var statusCodeStrings = map[int]string{
 }
 
 // statusCodeToString converts status code to string using pre-allocated strings when possible
+// statusClientClosedRequest (nginx's 499) records a request whose client left
+// before it was answered.
+const statusClientClosedRequest = 499
+
 func statusCodeToString(code int) string {
 	if s, ok := statusCodeStrings[code]; ok {
 		return s
@@ -484,6 +488,11 @@ func (rl *RateLimiter) CheckLimitN(ctx context.Context, ip, subdomain string, li
 	).Int64Slice()
 
 	if err != nil {
+		// The caller's request ended (client gone), not our deadline: says
+		// nothing about Redis, so it must not count toward the skip.
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return false, 0, time.Time{}, err
+		}
 		if rl.failures.Add(1) >= redisFailuresToSkip &&
 			time.Now().UnixNano()-rl.lastOK.Load() >= int64(redisTripAfter) &&
 			rl.downUntil.Swap(time.Now().Add(redisBackoff).UnixNano()) < now.UnixNano() {
@@ -1588,6 +1597,10 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 			globalRemaining = remaining
 			globalResetAt = resetAt
 
+			if err != nil && r.Context().Err() != nil {
+				w.WriteHeader(statusClientClosedRequest) // client gone: nothing to limit or proxy
+				return
+			}
 			if err != nil {
 				// Redis error - log and fail open (allow request)
 				// errRedisUnavailable was already logged once when Redis failed.
@@ -1632,6 +1645,10 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 				ipWeight,
 			)
 
+			if err != nil && r.Context().Err() != nil {
+				w.WriteHeader(statusClientClosedRequest) // client gone: nothing to limit or proxy
+				return
+			}
 			if err != nil {
 				// Redis error - log and fail open (allow request)
 				// errRedisUnavailable was already logged once when Redis failed.
@@ -2046,7 +2063,7 @@ func (s *ProxyService) createReverseProxy() *httputil.ReverseProxy {
 				if meta, ok := req.Context().Value(proxyMetadataField).(proxyMetadata); ok {
 					if mctx, ok := req.Context().Value(metricsContextKey).(*metricsContext); ok {
 						mctx.backend = meta.backend
-						mctx.statusCode = 499
+						mctx.statusCode = statusClientClosedRequest
 					}
 				}
 				return
@@ -2264,8 +2281,11 @@ func metricsWrapper(next http.Handler) http.Handler {
 
 		// Record metrics in defer to guarantee execution even on panic
 		defer func() {
-			// Update status code from wrapper
-			mctx.statusCode = wrapper.statusCode
+			// Update status code from wrapper, unless nothing was written: then
+			// keep what a handler set directly (499 for a client that left).
+			if wrapper.written {
+				mctx.statusCode = wrapper.statusCode
+			}
 
 			// Record metrics exactly once
 			if !mctx.metricsWritten {
