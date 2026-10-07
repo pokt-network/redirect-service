@@ -461,7 +461,7 @@ func TestBatchRateLimitRealServer(t *testing.T) {
 	}
 
 	pr, pw := io.Pipe()
-	defer pw.Close()
+	defer func() { _ = pw.Close() }()
 	go func() { _, _ = pw.Write([]byte(`[{"id":1},`)) }() // then stalls
 	start := time.Now()
 	if resp := post(pr); resp.StatusCode != http.StatusRequestEntityTooLarge {
