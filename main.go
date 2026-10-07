@@ -256,7 +256,7 @@ type RateLimitConfig struct {
 	Window   time.Duration // Time window for rate limit
 	Message  string        // Custom rate limit exceeded message
 	// CountBatchItems charges a JSON-RPC batch one unit per item instead of
-	// one per HTTP request. Per-IP limits only; see batchWeight.
+	// one per HTTP request; see batchWeight.
 	CountBatchItems bool
 }
 
@@ -273,11 +273,15 @@ type ServiceConfig struct {
 	RateLimitMessage string `yaml:"rate_limit_message,omitempty"`
 	// RateLimitCountBatchItems makes the per-IP rate_limit count each item of a
 	// JSON-RPC batch, so a 100-item batch costs 100 instead of 1. Off by default.
-	RateLimitCountBatchItems bool               `yaml:"rate_limit_count_batch_items,omitempty"`
-	RetryPolicy              string             `yaml:"retry_policy,omitempty"` // "fail-fast" (default) or "retry-all" — server-side override
-	HealthCheck              *HealthCheckConfig `yaml:"health_check,omitempty"`
-	Backends                 []BackendConfig    `yaml:"backends"`
-	Fallbacks                []BackendConfig    `yaml:"fallbacks,omitempty"`
+	RateLimitCountBatchItems bool `yaml:"rate_limit_count_batch_items,omitempty"`
+	// RateLimitGlobalCountBatchItems does the same for rate_limit_global. It is
+	// separate so turning on per-IP counting never changes what an existing
+	// global number means.
+	RateLimitGlobalCountBatchItems bool               `yaml:"rate_limit_global_count_batch_items,omitempty"`
+	RetryPolicy                    string             `yaml:"retry_policy,omitempty"` // "fail-fast" (default) or "retry-all" — server-side override
+	HealthCheck                    *HealthCheckConfig `yaml:"health_check,omitempty"`
+	Backends                       []BackendConfig    `yaml:"backends"`
+	Fallbacks                      []BackendConfig    `yaml:"fallbacks,omitempty"`
 }
 
 type BackendConfig struct {
@@ -997,7 +1001,11 @@ func (s *ProxyService) LoadRules() error {
 				if svc.RateLimitMessage != "" {
 					globalLimit.Message = strings.TrimSpace(svc.RateLimitMessage)
 				}
+				globalLimit.CountBatchItems = svc.RateLimitGlobalCountBatchItems
 			}
+		}
+		if svc.RateLimitGlobalCountBatchItems && globalLimit == nil {
+			log.Printf("WARN: rate_limit_global_count_batch_items for service '%s' needs a valid rate_limit_global, ignoring", subdomain)
 		}
 
 		// Process primary backends with weight expansion
@@ -1521,15 +1529,60 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		var globalRemaining int
 		var globalResetAt time.Time
 
+		// Per-IP limit: the service's own, else the default.
+		var rateLimitConfig *RateLimitConfig
+		if len(backends) > 0 && backends[0].RateLimit != nil {
+			rateLimitConfig = backends[0].RateLimit
+		} else if s.defaultRateLimit != nil {
+			rateLimitConfig = s.defaultRateLimit
+		}
+		var globalConfig *RateLimitConfig
+		if len(backends) > 0 {
+			globalConfig = backends[0].GlobalLimit
+		}
+
+		// Count JSON-RPC batch items once, before either limit charges them.
+		countIP := rateLimitConfig != nil && rateLimitConfig.CountBatchItems
+		countGlobal := globalConfig != nil && globalConfig.CountBatchItems
+		ipWeight, globalWeight := 1, 1
+		if (countIP || countGlobal) && r.Method == http.MethodPost && !isStreamingRequest(r) {
+			maxItems := math.MaxInt
+			if countIP {
+				maxItems = rateLimitConfig.Requests
+			}
+			if countGlobal {
+				maxItems = min(maxItems, globalConfig.Requests)
+			}
+			// ErrNotSupported (no deadline support) leaves the read unbounded, as before.
+			rc := http.NewResponseController(w)
+			_ = rc.SetReadDeadline(time.Now().Add(batchPeekTimeout))
+			n, ok := batchWeight(r)
+			// Back to no deadline: Server.ReadTimeout is 0, so there is none to restore.
+			_ = rc.SetReadDeadline(time.Time{})
+			// A batch that cannot be counted, or that exceeds a whole limit, never
+			// fits: say so instead of a 429 the client would retry forever.
+			if !ok || n > maxItems {
+				http.Error(w, "Payload Too Large: a JSON-RPC batch must be a valid JSON array of at most "+
+					strconv.Itoa(maxItems)+" items and "+strconv.Itoa(maxBatchPeekBytes>>20)+"MB", http.StatusRequestEntityTooLarge)
+				return
+			}
+			if countIP {
+				ipWeight = n
+			}
+			if countGlobal {
+				globalWeight = n
+			}
+		}
+
 		// Check global rate limit first (all IPs combined for this service)
-		if len(backends) > 0 && backends[0].GlobalLimit != nil {
-			globalConfig := backends[0].GlobalLimit
-			allowed, remaining, resetAt, err := s.rateLimiter.CheckLimit(
+		if globalConfig != nil {
+			allowed, remaining, resetAt, err := s.rateLimiter.CheckLimitN(
 				r.Context(),
 				"global", // Use "global" as the "IP" to create a service-wide key
 				subdomain,
 				globalConfig.Requests,
 				globalConfig.Window,
+				globalWeight,
 			)
 
 			globalRemaining = remaining
@@ -1569,38 +1622,14 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Check per-IP rate limit
-		var rateLimitConfig *RateLimitConfig
-		if len(backends) > 0 && backends[0].RateLimit != nil {
-			rateLimitConfig = backends[0].RateLimit
-		} else if s.defaultRateLimit != nil {
-			rateLimitConfig = s.defaultRateLimit
-		}
-
 		if rateLimitConfig != nil {
-			weight := 1
-			if rateLimitConfig.CountBatchItems && r.Method == http.MethodPost && !isStreamingRequest(r) {
-				// ErrNotSupported (no deadline support) leaves the read unbounded, as before.
-				rc := http.NewResponseController(w)
-				_ = rc.SetReadDeadline(time.Now().Add(batchPeekTimeout))
-				n, ok := batchWeight(r)
-				// Back to no deadline: Server.ReadTimeout is 0, so there is none to restore.
-				_ = rc.SetReadDeadline(time.Time{})
-				// A batch that cannot be counted, or that exceeds the whole limit,
-				// never fits: say so instead of a 429 the client would retry forever.
-				if !ok || n > rateLimitConfig.Requests {
-					http.Error(w, "Payload Too Large: a JSON-RPC batch must be a valid JSON array of at most "+
-						strconv.Itoa(rateLimitConfig.Requests)+" items and "+strconv.Itoa(maxBatchPeekBytes>>20)+"MB", http.StatusRequestEntityTooLarge)
-					return
-				}
-				weight = n
-			}
 			allowed, remaining, resetAt, err := s.rateLimiter.CheckLimitN(
 				r.Context(),
 				clientIP,
 				subdomain,
 				rateLimitConfig.Requests,
 				rateLimitConfig.Window,
-				weight,
+				ipWeight,
 			)
 
 			if err != nil {

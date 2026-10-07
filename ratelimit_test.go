@@ -471,3 +471,54 @@ func TestBatchRateLimitRealServer(t *testing.T) {
 		t.Fatalf("stalled batch held the handler for %s", took)
 	}
 }
+
+// TestGlobalBatchCountingIsSeparate pins the two flags apart: per-IP counting
+// alone leaves the global limit at one unit per request, and global counting
+// charges every item against the service-wide budget, across client IPs.
+func TestGlobalBatchCountingIsSeparate(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(backend.Close)
+	const batch = `[{"id":1},{"id":2},{"id":3}]`
+	post := func(svc *ProxyService, ip, body string) int {
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		req.Host = "test.api.pocket.network"
+		req.RemoteAddr = ip + ":1234"
+		rec := httptest.NewRecorder()
+		svc.Router().ServeHTTP(rec, req)
+		return rec.Code
+	}
+	newSvc := func(perIP, global *RateLimitConfig) *ProxyService {
+		svc := NewProxyService("examples/proxies.yaml", newTestRateLimiter(t), true, nil, false)
+		injectRules(svc, map[string][]ProxyRule{"test": {{ProxyTo: backend.URL, Weight: 1, RateLimit: perIP, GlobalLimit: global}}})
+		return svc
+	}
+
+	// Per-IP counting only: a global limit of 5 admits five 3-item batches.
+	svc := newSvc(&RateLimitConfig{Requests: 100, Window: time.Minute, CountBatchItems: true},
+		&RateLimitConfig{Requests: 5, Window: time.Minute})
+	for i := 1; i <= 5; i++ {
+		if code := post(svc, "192.0.2.1", batch); code != http.StatusOK {
+			t.Fatalf("per-IP counting, batch %d: status %d, want 200", i, code)
+		}
+	}
+	if code := post(svc, "192.0.2.1", batch); code != http.StatusTooManyRequests {
+		t.Fatalf("per-IP counting, batch 6: status %d, want 429", code)
+	}
+
+	// Global counting: 3 items from one IP leave 2 for everyone else.
+	svc = newSvc(nil, &RateLimitConfig{Requests: 5, Window: time.Minute, CountBatchItems: true})
+	steps := []struct {
+		ip, body string
+		want     int
+	}{
+		{"192.0.2.1", batch, http.StatusOK},
+		{"192.0.2.2", batch, http.StatusTooManyRequests},
+		{"192.0.2.2", `{"id":1}`, http.StatusOK},
+		{"192.0.2.3", `[{"id":1},{"id":2},{"id":3},{"id":4},{"id":5},{"id":6}]`, http.StatusRequestEntityTooLarge},
+	}
+	for i, st := range steps {
+		if code := post(svc, st.ip, st.body); code != st.want {
+			t.Fatalf("global counting, step %d: status %d, want %d", i, code, st.want)
+		}
+	}
+}
