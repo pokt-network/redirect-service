@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -596,5 +597,83 @@ func TestClientGoneDuringBackendCallRecords499(t *testing.T) {
 
 	if got := counterValue(closed) - before; got != 1 {
 		t.Errorf("499 requests rose by %v, want 1", got)
+	}
+}
+
+// TestCheckLimitsAllOrNothing pins the combined check: a request one limit
+// rejects consumes no budget on the other. When global and per-IP were two
+// calls, a request the per-IP limit rejected had already been charged to the
+// global limit.
+func TestCheckLimitsAllOrNothing(t *testing.T) {
+	rl := newTestRateLimiter(t)
+	ctx := context.Background()
+	card := func(ip string) int64 { return rl.redis.ZCard(ctx, "ratelimit:eth:"+ip).Val() }
+	check := func(ip string, global int) (bool, []limitResult) {
+		allowed, res, err := rl.CheckLimits(ctx, "eth", []limitCheck{
+			{"global", global, time.Minute, 1},
+			{ip, 3, time.Minute, 1},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return allowed, res
+	}
+
+	for i := 1; i <= 3; i++ {
+		if allowed, _ := check("1.2.3.4", 10); !allowed {
+			t.Fatalf("request %d rejected", i)
+		}
+	}
+	// Per-IP full: rejected, and the global limit that had room is not charged.
+	allowed, res := check("1.2.3.4", 10)
+	if allowed || !res[0].allowed || res[1].allowed || res[0].remaining != 7 || card("global") != 3 {
+		t.Fatalf("per-IP rejection: allowed=%v results=%+v global card=%d, want false, global fits with 7 left and card 3", allowed, res, card("global"))
+	}
+	// Global full: rejected, and the per-IP limit that had room is not charged.
+	allowed, res = check("5.6.7.8", 3)
+	if allowed || res[0].allowed || !res[1].allowed || card("5.6.7.8") != 0 {
+		t.Fatalf("global rejection: allowed=%v results=%+v per-IP card=%d, want false, per-IP fits and card 0", allowed, res, card("5.6.7.8"))
+	}
+}
+
+// countRoundTrips counts the commands a go-redis client sends.
+type countRoundTrips struct{ n atomic.Int32 }
+
+func (h *countRoundTrips) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *countRoundTrips) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error { h.n.Add(1); return next(ctx, cmd) }
+}
+func (h *countRoundTrips) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+
+// TestGlobalAndPerIPOneRoundTrip pins that a request with both limits costs one
+// Redis command: on 2026-10-07 pods off Redis's node paid two cross-node round
+// trips per request (p50 ~2-3ms each) and twice the exposure to stalls.
+func TestGlobalAndPerIPOneRoundTrip(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(backend.Close)
+	rl := newTestRateLimiter(t)
+	hook := &countRoundTrips{}
+	rl.redis.AddHook(hook)
+	svc := NewProxyService("examples/proxies.yaml", rl, true, &RateLimitConfig{Requests: 100, Window: time.Minute}, false)
+	injectRules(svc, map[string][]ProxyRule{"test": {{ProxyTo: backend.URL, Weight: 1,
+		GlobalLimit: &RateLimitConfig{Requests: 1000, Window: time.Minute}}}})
+	get := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Host = "test.api.pocket.network"
+		rec := httptest.NewRecorder()
+		svc.Router().ServeHTTP(rec, req)
+		return rec
+	}
+
+	get() // loads the script (EVALSHA, then EVAL on NOSCRIPT)
+	before := hook.n.Load()
+	rec := get()
+	if got := hook.n.Load() - before; got != 1 {
+		t.Fatalf("request with global and per-IP limits sent %d Redis commands, want 1", got)
+	}
+	if rec.Header().Get("X-RateLimit-Remaining") != "98" || rec.Header().Get("X-RateLimit-Remaining-Global") != "998" {
+		t.Fatalf("remaining per-IP %q global %q, want 98 and 998", rec.Header().Get("X-RateLimit-Remaining"), rec.Header().Get("X-RateLimit-Remaining-Global"))
 	}
 }

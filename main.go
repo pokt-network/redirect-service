@@ -395,51 +395,84 @@ func newRedisClient(addr, password string, db int) *redis.Client {
 // It checks the count BEFORE adding the request, so blocked requests don't consume budget.
 // Running as a Lua script ensures atomicity across multiple Taiji pods sharing the same Redis.
 //
-// Return contract: {allowed, used}. allowed is 1 or 0; used is the number of
-// units in the window after this call (including this request's weight when
-// allowed), so the caller can report what is left either way.
+// It takes one sorted set per limit (KEYS), so a request's global and per-IP
+// limits cost one round trip, and charges all of them or none: a request one
+// limit rejects consumes no budget on the others. The keys can sit in different
+// hash slots, which only standalone Redis allows (Taiji's Redis is standalone).
 //
-// The separate allowed flag is load-bearing. An earlier version returned only the
-// count clamped at `limit` — because a full window skips the ZADD, `count` could
-// never exceed `limit`, so the caller's `count <= limit` test was true even at
-// capacity and the limiter never blocked a single request in production. "At
+// ARGV[1] is now (unix nanos); then four ARGV per key: window start, limit, TTL
+// seconds, weight. With one key that is the layout of the one-key script before.
+//
+// Return contract: {allowed, fits_1, used_1, fits_2, used_2, ...}. allowed is 1
+// when every key fits; fits_k is 1 when key k alone had room; used_k is the
+// number of units in key k's window after this call (including this request's
+// weight when allowed), so the caller can report what is left either way.
+//
+// The separate allowed flags are load-bearing. An earlier version returned only
+// the count clamped at `limit` — because a full window skips the ZADD, `count`
+// could never exceed `limit`, so the caller's `count <= limit` test was true even
+// at capacity and the limiter never blocked a single request in production. "At
 // capacity" and "exactly full but allowed" are indistinguishable from a count
 // alone; they have to be different return values.
 var rateLimitScript = redis.NewScript(`
-local key = KEYS[1]
 local now = tonumber(ARGV[1])
-local window_start = tonumber(ARGV[2])
-local limit = tonumber(ARGV[3])
-local ttl = tonumber(ARGV[4])
-local weight = tonumber(ARGV[5]) or 1
+local used, fits = {}, {}
+local allowed = 1
 
--- Clean up old entries
-redis.call('ZREMRANGEBYSCORE', key, '0', window_start)
+for k = 1, #KEYS do
+    local a = 4 * k - 2 -- ARGV index of this key's window start
 
--- Count current requests in window
-local count = redis.call('ZCARD', key)
+    -- Clean up old entries, then count the requests left in the window
+    redis.call('ZREMRANGEBYSCORE', KEYS[k], '0', ARGV[a])
+    used[k] = redis.call('ZCARD', KEYS[k])
 
--- Not enough room for the whole weight: reject without consuming budget. Refresh
--- the TTL anyway so a saturated key still expires once traffic stops.
--- With weight 1 this is the original "count >= limit" test.
-if count + weight > limit then
-    redis.call('EXPIRE', key, ttl)
-    return {0, count}
+    -- Not enough room for the whole weight. With weight 1 this is the original
+    -- "count >= limit" test.
+    if used[k] + tonumber(ARGV[a + 3]) > tonumber(ARGV[a + 1]) then
+        fits[k] = 0
+        allowed = 0
+    else
+        fits[k] = 1
+    end
 end
 
--- One member per unit; members must be unique within the sorted set. Build them
--- from the ARGV[1] string, not the number: Lua prints a nanosecond timestamp
--- with 14 significant digits, so batches ~100µs apart would share members and
--- overwrite each other instead of adding up.
-for i = 1, weight do
-    redis.call('ZADD', key, now, ARGV[1] .. ':' .. i)
+local out = {allowed}
+for k = 1, #KEYS do
+    local a = 4 * k - 2
+    if allowed == 1 then
+        -- One member per unit; members must be unique within the sorted set.
+        -- Build them from the ARGV[1] string, not the number: Lua prints a
+        -- nanosecond timestamp with 14 significant digits, so batches ~100µs
+        -- apart would share members and overwrite each other instead of adding up.
+        local weight = tonumber(ARGV[a + 3])
+        for i = 1, weight do
+            redis.call('ZADD', KEYS[k], now, ARGV[1] .. ':' .. i)
+        end
+        used[k] = used[k] + weight
+    end
+    -- Refresh the TTL on reject too, so a saturated key still expires once
+    -- traffic stops.
+    redis.call('EXPIRE', KEYS[k], ARGV[a + 2])
+    out[2 * k] = fits[k]
+    out[2 * k + 1] = used[k]
 end
-
--- Set TTL for memory cleanup
-redis.call('EXPIRE', key, ttl)
-
-return {1, count + weight}
+return out
 `)
+
+// limitCheck is one limit charged by CheckLimits.
+type limitCheck struct {
+	ip     string // key suffix: the client IP, or "global" for the service-wide limit
+	limit  int
+	window time.Duration
+	weight int // units this request costs (a JSON-RPC batch of N items: N)
+}
+
+// limitResult is one limit's outcome in CheckLimits.
+type limitResult struct {
+	allowed   bool // this limit alone had room
+	remaining int
+	resetAt   time.Time
+}
 
 // CheckLimit checks if the request is within rate limit using sliding window algorithm.
 // Uses a Lua script for atomicity across multiple pods sharing the same Redis.
@@ -453,16 +486,29 @@ func (rl *RateLimiter) CheckLimit(ctx context.Context, ip, subdomain string, lim
 // of N items). The request is allowed only if the whole weight fits, so a batch
 // larger than the limit itself is always rejected.
 func (rl *RateLimiter) CheckLimitN(ctx context.Context, ip, subdomain string, limit int, window time.Duration, weight int) (bool, int, time.Time, error) {
-	if weight < 1 {
-		weight = 1
+	allowed, results, err := rl.CheckLimits(ctx, subdomain, []limitCheck{{ip, limit, window, weight}})
+	if err != nil {
+		return false, 0, time.Time{}, err
 	}
+	return allowed, results[0].remaining, results[0].resetAt, nil
+}
+
+// CheckLimits charges every check in one Redis round trip, all or nothing: the
+// request is allowed only if every limit has room for its weight, and a
+// rejected request consumes none of them. results[i] says whether checks[i]
+// alone had room and what it has left.
+func (rl *RateLimiter) CheckLimits(ctx context.Context, subdomain string, checks []limitCheck) (bool, []limitResult, error) {
+	results := make([]limitResult, len(checks))
 	if rl == nil || rl.redis == nil {
 		// Rate limiting disabled or Redis not available - allow request
-		return true, limit, time.Now().Add(window), nil
+		for i, c := range checks {
+			results[i] = limitResult{true, c.limit, time.Now().Add(c.window)}
+		}
+		return true, results, nil
 	}
 
 	if time.Now().UnixNano() < rl.downUntil.Load() {
-		return false, 0, time.Time{}, errRedisUnavailable
+		return false, nil, errRedisUnavailable
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, redisCheckTimeout)
@@ -475,38 +521,48 @@ func (rl *RateLimiter) CheckLimitN(ctx context.Context, ip, subdomain string, li
 	}()
 
 	now := time.Now()
-	key := "ratelimit:" + subdomain + ":" + ip
-	windowStart := now.Add(-window)
+	keys := make([]string, len(checks))
+	args := make([]any, 1, 1+4*len(checks))
+	args[0] = now.UnixNano() // ARGV[1]: current timestamp
+	for i, c := range checks {
+		keys[i] = "ratelimit:" + subdomain + ":" + c.ip
+		args = append(args,
+			now.Add(-c.window).UnixNano(), // window start
+			c.limit,                       // max units in the window
+			int(c.window.Seconds())+1,     // TTL in seconds (window + 1s buffer)
+			max(c.weight, 1),              // units this request costs
+		)
+	}
 
 	// Execute atomic Lua script
-	res, err := rateLimitScript.Run(ctx, rl.redis, []string{key},
-		now.UnixNano(),          // ARGV[1]: current timestamp
-		windowStart.UnixNano(),  // ARGV[2]: window start
-		limit,                   // ARGV[3]: max requests
-		int(window.Seconds())+1, // ARGV[4]: TTL in seconds (window + 1s buffer)
-		weight,                  // ARGV[5]: units this request costs
-	).Int64Slice()
+	res, err := rateLimitScript.Run(ctx, rl.redis, keys, args...).Int64Slice()
 
 	if err != nil {
 		// The caller's request ended (client gone), not our deadline: says
 		// nothing about Redis, so it must not count toward the skip.
 		if errors.Is(ctx.Err(), context.Canceled) {
-			return false, 0, time.Time{}, err
+			return false, nil, err
 		}
 		if rl.failures.Add(1) >= redisFailuresToSkip &&
 			time.Now().UnixNano()-rl.lastOK.Load() >= int64(redisTripAfter) &&
 			rl.downUntil.Swap(time.Now().Add(redisBackoff).UnixNano()) < now.UnixNano() {
 			log.Printf("ERROR: Redis rate limit checks failing, skipping rate limiting for %s: %v", redisBackoff, err)
 		}
-		return false, 0, time.Time{}, fmt.Errorf("redis rate limit script error: %w", err)
+		return false, nil, fmt.Errorf("redis rate limit script error: %w", err)
 	}
 	rl.failures.Store(0)
 	rl.lastOK.Store(now.UnixNano())
 
-	// Take allowed from the script's flag. Do not re-derive it from the count:
-	// see the rateLimitScript comment.
-	allowed, used := res[0] == 1, res[1]
-	return allowed, max(limit-int(used), 0), now.Add(window), nil
+	// Take allowed from the script's flags. Do not re-derive them from the
+	// counts: see the rateLimitScript comment.
+	for i, c := range checks {
+		results[i] = limitResult{
+			allowed:   res[1+2*i] == 1,
+			remaining: max(c.limit-int(res[2+2*i]), 0),
+			resetAt:   now.Add(c.window),
+		}
+	}
+	return res[0] == 1, results, nil
 }
 
 type proxyMetadata struct {
@@ -1535,9 +1591,6 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 
 	// Check rate limit if enabled
 	if s.rateLimitEnabled && s.rateLimiter != nil {
-		var globalRemaining int
-		var globalResetAt time.Time
-
 		// Per-IP limit: the service's own, else the default.
 		var rateLimitConfig *RateLimitConfig
 		if len(backends) > 0 && backends[0].RateLimit != nil {
@@ -1583,42 +1636,46 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Check global rate limit first (all IPs combined for this service)
+		// Charge the global and per-IP limits in one Redis round trip. A
+		// global rejection is answered first, as when they were two calls.
+		var checks []limitCheck
+		gi, ii := -1, -1
 		if globalConfig != nil {
-			allowed, remaining, resetAt, err := s.rateLimiter.CheckLimitN(
-				r.Context(),
-				"global", // Use "global" as the "IP" to create a service-wide key
-				subdomain,
-				globalConfig.Requests,
-				globalConfig.Window,
-				globalWeight,
-			)
-
-			globalRemaining = remaining
-			globalResetAt = resetAt
-
-			if err != nil && r.Context().Err() != nil {
+			gi = len(checks)
+			// "global" as the "IP" makes a service-wide key
+			checks = append(checks, limitCheck{"global", globalConfig.Requests, globalConfig.Window, globalWeight})
+		}
+		if rateLimitConfig != nil {
+			ii = len(checks)
+			checks = append(checks, limitCheck{clientIP, rateLimitConfig.Requests, rateLimitConfig.Window, ipWeight})
+		}
+		if len(checks) > 0 {
+			_, results, err := s.rateLimiter.CheckLimits(r.Context(), subdomain, checks)
+			switch {
+			case err != nil && r.Context().Err() != nil:
 				w.WriteHeader(statusClientClosedRequest) // client gone: nothing to limit or proxy
 				return
-			}
-			if err != nil {
+
+			case err != nil:
 				// Redis error - log and fail open (allow request)
 				// errRedisUnavailable was already logged once when Redis failed.
 				if !errors.Is(err, errRedisUnavailable) {
-					log.Printf("ERROR: Global rate limit check failed for subdomain %s: %v (failing open)", subdomain, err)
+					log.Printf("ERROR: Rate limit check failed for IP %s, subdomain %s: %v (failing open)", clientIP, subdomain, err)
 				}
 				proxyRateLimitRedisErrorsTotal.Inc()
-			} else if !allowed {
+
+			case gi >= 0 && !results[gi].allowed:
 				// Global rate limit exceeded - return 429
+				global := results[gi]
 				proxyRateLimitRequestsTotal.WithLabelValues(subdomain, "blocked").Inc()
 
-				retryAfter := int(time.Until(resetAt).Seconds())
+				retryAfter := int(time.Until(global.resetAt).Seconds())
 				if retryAfter < 0 {
 					retryAfter = 0
 				}
 				w.Header().Set("X-RateLimit-Limit-Global", strconv.Itoa(globalConfig.Requests))
-				w.Header().Set("X-RateLimit-Remaining-Global", strconv.Itoa(remaining))
-				w.Header().Set("X-RateLimit-Reset-Global", strconv.FormatInt(resetAt.Unix(), 10))
+				w.Header().Set("X-RateLimit-Remaining-Global", strconv.Itoa(global.remaining))
+				w.Header().Set("X-RateLimit-Reset-Global", strconv.FormatInt(global.resetAt.Unix(), 10))
 				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 
 				// Determine which rate limit message to use (priority: per-service > global default > hardcoded)
@@ -1631,50 +1688,27 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 
 				http.Error(w, message, http.StatusTooManyRequests)
 				return
-			}
-		}
 
-		// Check per-IP rate limit
-		if rateLimitConfig != nil {
-			allowed, remaining, resetAt, err := s.rateLimiter.CheckLimitN(
-				r.Context(),
-				clientIP,
-				subdomain,
-				rateLimitConfig.Requests,
-				rateLimitConfig.Window,
-				ipWeight,
-			)
-
-			if err != nil && r.Context().Err() != nil {
-				w.WriteHeader(statusClientClosedRequest) // client gone: nothing to limit or proxy
-				return
-			}
-			if err != nil {
-				// Redis error - log and fail open (allow request)
-				// errRedisUnavailable was already logged once when Redis failed.
-				if !errors.Is(err, errRedisUnavailable) {
-					log.Printf("ERROR: Rate limit check failed for IP %s, subdomain %s: %v (failing open)", clientIP, subdomain, err)
-				}
-				proxyRateLimitRedisErrorsTotal.Inc()
-			} else {
+			case ii >= 0:
+				perIP := results[ii]
 				// Add per-IP rate limit headers to response
 				w.Header().Set("X-RateLimit-Limit", strconv.Itoa(rateLimitConfig.Requests))
-				w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
-				w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(resetAt.Unix(), 10))
+				w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(perIP.remaining))
+				w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(perIP.resetAt.Unix(), 10))
 
 				// Add global rate limit headers if global limit is configured
-				if len(backends) > 0 && backends[0].GlobalLimit != nil {
-					w.Header().Set("X-RateLimit-Limit-Global", strconv.Itoa(backends[0].GlobalLimit.Requests))
-					w.Header().Set("X-RateLimit-Remaining-Global", strconv.Itoa(globalRemaining))
-					w.Header().Set("X-RateLimit-Reset-Global", strconv.FormatInt(globalResetAt.Unix(), 10))
+				if gi >= 0 {
+					w.Header().Set("X-RateLimit-Limit-Global", strconv.Itoa(globalConfig.Requests))
+					w.Header().Set("X-RateLimit-Remaining-Global", strconv.Itoa(results[gi].remaining))
+					w.Header().Set("X-RateLimit-Reset-Global", strconv.FormatInt(results[gi].resetAt.Unix(), 10))
 				}
 
-				if !allowed {
+				if !perIP.allowed {
 					// Per-IP rate limit exceeded - return 429
 					proxyRateLimitRequestsTotal.WithLabelValues(subdomain, "blocked").Inc()
-					proxyRateLimitRemaining.WithLabelValues(subdomain).Set(float64(remaining))
+					proxyRateLimitRemaining.WithLabelValues(subdomain).Set(float64(perIP.remaining))
 
-					retryAfter := int(time.Until(resetAt).Seconds())
+					retryAfter := int(time.Until(perIP.resetAt).Seconds())
 					if retryAfter < 0 {
 						retryAfter = 0
 					}
@@ -1696,7 +1730,7 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 
 				// Rate limit check passed
 				proxyRateLimitRequestsTotal.WithLabelValues(subdomain, "allowed").Inc()
-				proxyRateLimitRemaining.WithLabelValues(subdomain).Set(float64(remaining))
+				proxyRateLimitRemaining.WithLabelValues(subdomain).Set(float64(perIP.remaining))
 			}
 		}
 	}
