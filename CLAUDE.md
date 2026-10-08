@@ -104,6 +104,7 @@ All application logic lives in `main.go`. This is intentional for simplicity and
 - Format: `100/1m`, `1000/1h`, `10/30s`
 
 **Request Handling**
+- **CORS preflight** (`OPTIONS` with `Origin` and `Access-Control-Request-Method`): answered by Taiji with 204 and `Access-Control-Max-Age: 86400`, before rate limiting; never reaches a backend. Plain `OPTIONS` is proxied and rate limited as usual.
 - **Streaming requests** (WebSocket, gRPC): Direct proxy, no buffering, no retry
 - **Retry-all policy**: Server-side config only (`retry_policy: retry-all` in YAML). Buffers response, retries on 5xx/429. Client `Retry-Policy` header is ignored for security.
 - **Fail-fast/default**: Zero-copy streaming, optimal performance (`FlushInterval: -1`)

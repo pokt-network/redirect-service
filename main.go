@@ -1559,6 +1559,22 @@ func (s *ProxyService) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Answer CORS preflights here, before the limiter: forwarding them cost a
+	// Redis round trip, a slot of both limits and a backend hop each. They carry
+	// no credentials. Max-Age lets browsers cache the answer (Chrome caps it at 2h).
+	if r.Method == http.MethodOptions && r.Header.Get("Origin") != "" && r.Header.Get("Access-Control-Request-Method") != "" {
+		h := w.Header()
+		h.Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
+		h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		if reqHeaders := r.Header.Get("Access-Control-Request-Headers"); reqHeaders != "" {
+			h.Set("Access-Control-Allow-Headers", reqHeaders)
+		}
+		h.Set("Access-Control-Max-Age", "86400")
+		h.Set("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	// Filter to healthy backends
 	healthyBackends := s.filterHealthyBackends(subdomain, backends)
 

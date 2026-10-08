@@ -427,6 +427,50 @@ func TestBatchRateLimitThroughProxy(t *testing.T) {
 	}
 }
 
+// TestPreflightSkipsLimiter: a CORS preflight is answered by taiji, cacheable,
+// and charges neither limit nor reaches the backend; a plain OPTIONS still does.
+func TestPreflightSkipsLimiter(t *testing.T) {
+	hits := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++ }))
+	t.Cleanup(backend.Close)
+
+	limit := &RateLimitConfig{Requests: 1, Window: time.Minute}
+	svc := NewProxyService("examples/proxies.yaml", newTestRateLimiter(t), true, limit, false)
+	injectRules(svc, map[string][]ProxyRule{"test": {{ProxyTo: backend.URL, Weight: 1, GlobalLimit: limit}}})
+
+	send := func(method string, preflight bool) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, "/", nil)
+		req.Host = "test.api.pocket.network"
+		if preflight {
+			req.Header.Set("Origin", "https://app.example")
+			req.Header.Set("Access-Control-Request-Method", "POST")
+			req.Header.Set("Access-Control-Request-Headers", "content-type")
+		}
+		rec := httptest.NewRecorder()
+		svc.Router().ServeHTTP(rec, req)
+		return rec
+	}
+
+	for i := 0; i < 3; i++ {
+		rec := send(http.MethodOptions, true)
+		h := rec.Header()
+		if rec.Code != http.StatusNoContent || h.Get("Access-Control-Allow-Origin") != "https://app.example" ||
+			h.Get("Access-Control-Allow-Headers") != "content-type" || h.Get("Access-Control-Max-Age") != "86400" ||
+			h.Get("X-RateLimit-Remaining") != "" {
+			t.Fatalf("preflight %d: status %d headers %v", i, rec.Code, h)
+		}
+	}
+	if rec := send(http.MethodPost, false); rec.Code != http.StatusOK {
+		t.Fatalf("POST after preflights: status %d, want 200 (preflights must not charge the limit)", rec.Code)
+	}
+	if rec := send(http.MethodOptions, false); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("plain OPTIONS: status %d, want 429 (still limited)", rec.Code)
+	}
+	if hits != 1 {
+		t.Fatalf("backend hits = %d, want 1 (only the POST)", hits)
+	}
+}
+
 // TestBatchRateLimitRealServer runs the peek on a real connection: the body
 // reaches the backend byte-identical, and a body that stalls inside a batch hits
 // the read deadline and gets 413 instead of holding the handler.
